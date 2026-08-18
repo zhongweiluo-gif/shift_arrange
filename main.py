@@ -12,7 +12,6 @@ from googleapiclient.http import MediaIoBaseDownload
 
 # ================= ベースパス取得関数 =================
 def get_base_path():
-    """実行環境のベースパスを取得（PyInstallerのexe化に対応）"""
     if getattr(sys, 'frozen', False):
         return os.path.dirname(sys.executable)
     else:
@@ -24,13 +23,9 @@ try:
     with open(config_path, 'r', encoding='utf-8') as f:
         CONFIG = json.load(f)
 except FileNotFoundError:
-    print(f"❌ エラー: 設定ファイル [{config_path}] が見つかりません。作成してください。")
-    sys.exit(1)
-except json.JSONDecodeError:
-    print(f"❌ エラー: [{config_path}] のフォーマットが正しくありません。JSONの構文を確認してください。")
+    print(f"❌ エラー: 設定ファイル [{config_path}] が見つかりません。")
     sys.exit(1)
 
-# 動的なファイル設定の取得
 FILES = CONFIG.get('FILE_SETTINGS', {})
 SPREADSHEET_ID = FILES.get('SPREADSHEET_ID', '')
 DOWNLOAD_TASKS = [
@@ -42,15 +37,10 @@ SCOPES = ['https://www.googleapis.com/auth/drive.readonly']
 CREDENTIALS_FILE = os.path.join(get_base_path(), 'credentials.json')
 TOKEN_FILE = os.path.join(get_base_path(), 'token_drive_exporter.json')
 
-
-# ================= 1. Google Drive API ログイン＆ダウンロード =================
+# ================= 1. Google Drive API =================
 def get_drive_service():
-    """Google Drive API 認証"""
     if not os.path.exists(CREDENTIALS_FILE):
-        raise FileNotFoundError(
-            f'❌ [{CREDENTIALS_FILE}] が見つかりません。Google Client Secret JSON'
-            ' ファイルをexeと同じ階層に配置してください。'
-        )
+        raise FileNotFoundError(f'❌ [{CREDENTIALS_FILE}] が見つかりません。')
 
     creds = None
     if os.path.exists(TOKEN_FILE):
@@ -60,18 +50,8 @@ def get_drive_service():
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
         else:
-            flow = InstalledAppFlow.from_client_secrets_file(
-                CREDENTIALS_FILE, SCOPES
-            )
-            creds = flow.run_local_server(
-                port=0,
-                authorization_prompt_message=(
-                    'ポップアップしたブラウザで承認を完了してください...'
-                ),
-                success_message=(
-                    '✅ 承認が成功しました！プログラムに戻ってください。'
-                ),
-            )
+            flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_FILE, SCOPES)
+            creds = flow.run_local_server(port=0)
 
         with open(TOKEN_FILE, 'w') as token:
             token.write(creds.to_json())
@@ -79,12 +59,8 @@ def get_drive_service():
     return build('drive', 'v3', credentials=creds)
 
 def fetch_and_split_sheets():
-    """全体エクスポート＆特定シート抽出処理"""
     service = get_drive_service()
     temp_excel_path = os.path.join(get_base_path(), '_temp_full_export.xlsx')
-
-    print(f'📥 クラウドからデータを取得中... (Spreadsheet ID: {SPREADSHEET_ID[:10]}...)')
-
     mime_type_xlsx = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
     request = service.files().export_media(fileId=SPREADSHEET_ID, mimeType=mime_type_xlsx)
 
@@ -94,30 +70,16 @@ def fetch_and_split_sheets():
         while not done:
             status, done = downloader.next_chunk()
 
-    print('✅ クラウドからのエクスポートが完了しました。指定シートの抽出・分割を行います...\n')
-
     for target_sheet, output_filename in DOWNLOAD_TASKS:
-        if not target_sheet: continue # シート名が空の場合はスキップ
-        
+        if not target_sheet: continue
         out_path = os.path.join(get_base_path(), output_filename)
         wb = openpyxl.load_workbook(temp_excel_path)
-
-        if target_sheet not in wb.sheetnames:
-            print(f'⚠️ スプレッドシート内に [{target_sheet}] というシートが見つかりませんでした。スキップします。')
-            continue
-
+        if target_sheet not in wb.sheetnames: continue
         for sheet_name in wb.sheetnames:
-            if sheet_name != target_sheet:
-                del wb[sheet_name]
-
+            if sheet_name != target_sheet: del wb[sheet_name]
         wb.save(out_path)
-        print(f'💾 シート [{target_sheet}] の書式を保持して [{output_filename}] に保存しました！')
 
-    if os.path.exists(temp_excel_path):
-        os.remove(temp_excel_path)
-
-    print('\n🎉 すべての指定シートの抽出・保存が完了しました！\n')
-
+    if os.path.exists(temp_excel_path): os.remove(temp_excel_path)
 
 # ================= 2. PuLP 数理最適化ソルバー =================
 def solve_schedule_with_pulp(file_path, prev_month_file_path=None):
@@ -139,12 +101,9 @@ def solve_schedule_with_pulp(file_path, prev_month_file_path=None):
     for r in range(1, 10):
         for c in range(1, 20):
             val = ws.cell(row=r, column=c).value
-            if val == '名前':
-                name_col = c; header_row = r
-            elif val == 'チーム':
-                team_col = c
-            elif str(val) == '1' and header_row and r == header_row:
-                day_start_col = c
+            if val == '名前': name_col = c; header_row = r
+            elif val == 'チーム': team_col = c
+            elif str(val) == '1' and header_row and r == header_row: day_start_col = c
 
     target_rows, employees, teams, prefilled, red_border_cells = [], [], [], {}, set()
 
@@ -181,10 +140,7 @@ def solve_schedule_with_pulp(file_path, prev_month_file_path=None):
                 if has_red: prefilled[(emp_idx, d)] = val_str if val_str else '休'
                 elif val_str != '': prefilled[(emp_idx, d)] = val_str
 
-    # 前月データの読み込み
-    prev_month_aug31_night = set()
-    prev_month_aug31_ake = set()
-    prev_month_last5_work = {}
+    prev_month_aug31_night, prev_month_aug31_ake, prev_month_last5_work = set(), set(), {}
 
     def is_work_shift_name(val):
         val = str(val or '').strip()
@@ -193,7 +149,6 @@ def solve_schedule_with_pulp(file_path, prev_month_file_path=None):
     if prev_month_file_path and os.path.exists(prev_month_file_path):
         wb_lm = openpyxl.load_workbook(prev_month_file_path, data_only=True)
         ws_lm = wb_lm[wb_lm.sheetnames[0]]
-        
         name_col_l, day_start_col_l, header_row_l = None, None, None
         for r in range(1, 10):
             for c in range(1, 20):
@@ -216,8 +171,6 @@ def solve_schedule_with_pulp(file_path, prev_month_file_path=None):
             elif aug31_val == '明': prev_month_aug31_ake.add(e)
             last5 = aug_shifts[26:31] if len(aug_shifts) >= 31 else [''] * 5
             prev_month_last5_work[e] = [1 if is_work_shift_name(s) else 0 for s in last5]
-
-        print(f'📊 前月データの読み込み完了: 前月最終日夜勤(N) {len(prev_month_aug31_night)} 名、明け(明) {len(prev_month_aug31_ake)} 名。')
 
     def is_red_or_pink_color(hex_color):
         if not hex_color or len(hex_color) < 6: return False
@@ -273,11 +226,13 @@ def solve_schedule_with_pulp(file_path, prev_month_file_path=None):
 
         for e in range(num_emp):
             prob += pulp.lpSum([x[e][d][0] for d in range(num_days)]) == target_public_rests
+
+        for e in range(num_emp):
             if e in prev_month_aug31_night: prob += x[e][0][3] == 1
             else:
                 if (e, 0) not in prefilled or prefilled[(e, 0)] != '明': prob += x[e][0][3] == 0
             for d in range(num_days - 1): prob += x[e][d + 1][3] == x[e][d][2]
-            
+
             if e in prev_month_aug31_ake and (e, 0) not in prefilled: prob += x[e][0][0] + x[e][0][4] == 1
             for d in range(num_days - 1):
                 if not ((e, d + 1) in prefilled): prob += x[e][d + 1][0] + x[e][d + 1][4] >= x[e][d][3]
@@ -293,17 +248,47 @@ def solve_schedule_with_pulp(file_path, prev_month_file_path=None):
             prob += pulp.lpSum([x[e][d][2] for e in noc_seniors]) == 1
             prob += pulp.lpSum([x[e][d][2] for e in csc_seniors]) == 1
             if d > 0: prob += pulp.lpSum([x[e][d][3] for e in all_seniors]) == 2
-            
-            d2_sum = pulp.lpSum([y_d2[m][d] for m in mentor_indices])
-            if d in holiday_dates: prob += d2_sum == 0
-            else: prob += d2_sum == 1
-            
+
+        for e in noc_seniors:
+            prob += pulp.lpSum([x[e][d][2] for d in range(num_days)]) >= 3
+            prob += pulp.lpSum([x[e][d][2] for d in range(num_days)]) <= 4
+            prob += pulp.lpSum([x[e][d][1] for d in range(num_days)]) >= 4
+
+        for e in csc_seniors:
+            prob += pulp.lpSum([x[e][d][2] for d in range(num_days)]) >= 3
+            prob += pulp.lpSum([x[e][d][2] for d in range(num_days)]) <= 5
+
+        for e in trainee_indices:
+            prob += pulp.lpSum([x[e][d][2] for d in range(num_days)]) >= 3
+            prob += pulp.lpSum([x[e][d][2] for d in range(num_days)]) <= 5
+
+        special_task_words = {'CPN\n設置作業日', 'CPN設置作業日', '保全', 'メ'}
+        for d in range(num_days):
+            is_hol = d in holiday_dates
             for m in mentor_indices:
                 prob += y_d2[m][d] <= x[m][d][1]
-                if (m, d) in prefilled and str(prefilled[(m, d)]).strip() in {'CPN\n設置作業日', 'CPN設置作業日', '保全', 'メ'}:
-                    prob += y_d2[m][d] == 0
+                if (m, d) in prefilled:
+                    m_val = str(prefilled[(m, d)]).strip()
+                    if m_val in special_task_words or (m_val != '' and m_val != 'D'): prob += y_d2[m][d] == 0
 
-        # ペナルティ＆報酬の追加
+            d2_sum = pulp.lpSum([y_d2[m][d] for m in mentor_indices])
+            if is_hol: prob += d2_sum == 0
+            else: prob += d2_sum == 1
+
+        d2_max = pulp.LpVariable('d2_max', lowBound=0, cat=pulp.LpInteger)
+        d2_min = pulp.LpVariable('d2_min', lowBound=0, cat=pulp.LpInteger)
+        for m in mentor_indices:
+            total_d2_m = pulp.lpSum([y_d2[m][d] for d in range(num_days)])
+            prob += total_d2_m <= d2_max
+            prob += total_d2_m >= d2_min
+        penalties.append(CONFIG.get('PENALTY_D2_RANGE', 20000) * (d2_max - d2_min))
+
+        for m in mentor_indices:
+            for d in range(num_days - 2):
+                s_d2_dense = pulp.LpVariable(f'slack_d2_dense_{m}_{d}', cat=pulp.LpBinary)
+                prob += y_d2[m][d] + y_d2[m][d + 1] + y_d2[m][d + 2] - s_d2_dense <= 1
+                penalties.append(CONFIG.get('PENALTY_D2_DENSE', 15000) * s_d2_dense)
+
         for tr_name, mentor_name in night_partner_map.items():
             if tr_name in employees and mentor_name in employees:
                 tr_idx, m_idx = employees.index(tr_name), employees.index(mentor_name)
@@ -312,6 +297,98 @@ def solve_schedule_with_pulp(file_path, prev_month_file_path=None):
                     prob += x[tr_idx][d][2] - x[m_idx][d][2] <= s_np
                     penalties.append(CONFIG.get('PENALTY_NIGHT_PARTNER_MISSING', 50000) * s_np)
 
+        for e in range(num_emp):
+            for d in range(num_days):
+                for gap in range(1, 6):
+                    if d + gap < num_days:
+                        s_night_gap = pulp.LpVariable(f'slack_night_gap_{e}_{d}_{gap}', cat=pulp.LpBinary)
+                        prob += x[e][d][2] + x[e][d + gap][2] - 1 <= s_night_gap
+                        p_weight = CONFIG.get('PENALTY_NIGHT_GAP_TIGHT', 50000) if gap <= 2 else CONFIG.get('PENALTY_NIGHT_GAP_MODERATE', 30000)
+                        penalties.append(p_weight * s_night_gap)
+
+        noc_mentors = [m for m in mentor_indices if m in noc_seniors]
+        for d in range(num_days):
+            is_hol = d in holiday_dates
+            noc_sp_count = sum(1 for e in noc_seniors if (e, d) in prefilled and str(prefilled[(e, d)]).strip() in special_task_words)
+            noc_pure_d_sum = pulp.lpSum([x[e][d][1] for e in noc_seniors]) - pulp.lpSum([y_d2[m][d] for m in noc_mentors]) - noc_sp_count
+
+            if is_hol: prob += noc_pure_d_sum == 1
+            else: prob += noc_pure_d_sum >= 2
+
+            s_noc_over4 = pulp.LpVariable(f'slack_noc_over4_{d}', lowBound=0, cat=pulp.LpInteger)
+            prob += noc_pure_d_sum - s_noc_over4 <= 3
+            penalties.append(CONFIG.get('PENALTY_NOC_PURE_D_OVER3', 20000) * s_noc_over4)
+
+            if is_hol: prob += pulp.lpSum([x[e][d][1] for e in csc_seniors]) >= 1
+            else:
+                prob += pulp.lpSum([x[e][d][1] for e in csc_seniors]) >= 1
+                s_csc_d2 = pulp.LpVariable(f'slack_csc_d2_{d}', lowBound=0, cat=pulp.LpInteger)
+                prob += pulp.lpSum([x[e][d][1] for e in csc_seniors]) + s_csc_d2 >= 2
+                penalties.append(CONFIG.get('PENALTY_CSC_WEEKDAY_D_SHORT', 50000) * s_csc_d2)
+
+            if is_hol: prob += pulp.lpSum([x[e][d][2] for e in trainee_indices]) == 0
+            else: prob += pulp.lpSum([x[e][d][2] for e in trainee_indices]) <= 1
+
+        for e in range(num_emp):
+            for d in range(num_days):
+                start_7 = max(0, d - 6)
+                s_7_night = pulp.LpVariable(f'slack_7_night_{e}_{d}', lowBound=0, cat=pulp.LpInteger)
+                prob += pulp.lpSum([x[e][d_i][2] for d_i in range(start_7, d + 1)]) - s_7_night <= 2
+                penalties.append(CONFIG.get('PENALTY_ROLLING_7DAY_NIGHT_OVER2', 1000) * s_7_night)
+
+        for d in range(num_days):
+            s_d3_over = pulp.LpVariable(f'slack_d3_over_{d}', lowBound=0, cat=pulp.LpInteger)
+            prob += pulp.lpSum([x[e][d][1] for e in trainee_indices]) - s_d3_over <= 2
+            penalties.append(CONFIG.get('PENALTY_TRAINEE_D3_OVER2', 18000) * s_d3_over)
+
+        for d in holiday_dates:
+            for tr in trainee_indices:
+                penalties.append(CONFIG.get('PENALTY_TRAINEE_HOLIDAY_D3', 30000) * x[tr][d][1])
+
+        objective_terms = []
+        def is_rest(e_idx, day_idx):
+            return (x[e_idx][day_idx][0] + x[e_idx][day_idx][4]) if 0 <= day_idx < num_days else None
+
+        for e in range(num_emp):
+            for d in range(num_days - 1):
+                b2 = pulp.LpVariable(f'block_2_{e}_{d}', cat=pulp.LpBinary)
+                conds = [is_rest(e, d), is_rest(e, d + 1)]
+                r_p, r_n = is_rest(e, d - 1), is_rest(e, d + 2)
+                if r_p is not None: conds.append(1 - r_p)
+                if r_n is not None: conds.append(1 - r_n)
+                for c in conds: prob += b2 <= c
+                prob += b2 >= pulp.lpSum(conds) - (len(conds) - 1)
+                objective_terms.append(CONFIG.get('REWARD_REST_BLOCK_2', 30) * b2)
+
+            for d in range(num_days - 2):
+                b3 = pulp.LpVariable(f'block_3_{e}_{d}', cat=pulp.LpBinary)
+                conds = [is_rest(e, d), is_rest(e, d + 1), is_rest(e, d + 2)]
+                r_p, r_n = is_rest(e, d - 1), is_rest(e, d + 3)
+                if r_p is not None: conds.append(1 - r_p)
+                if r_n is not None: conds.append(1 - r_n)
+                for c in conds: prob += b3 <= c
+                prob += b3 >= pulp.lpSum(conds) - (len(conds) - 1)
+                objective_terms.append(CONFIG.get('REWARD_REST_BLOCK_3', 40) * b3)
+
+            for d in range(num_days - 3):
+                b4 = pulp.LpVariable(f'block_4plus_{e}_{d}', cat=pulp.LpBinary)
+                conds = [is_rest(e, d), is_rest(e, d + 1), is_rest(e, d + 2), is_rest(e, d + 3)]
+                for c in conds: prob += b4 <= c
+                prob += b4 >= pulp.lpSum(conds) - (len(conds) - 1)
+                objective_terms.append(CONFIG.get('REWARD_REST_BLOCK_4PLUS', 45) * b4)
+
+            for d in range(num_days - 5):
+                b6 = pulp.LpVariable(f'block_6plus_{e}_{d}', cat=pulp.LpBinary)
+                conds6 = [is_rest(e, d + i) for i in range(6)]
+                for c in conds6: prob += b6 <= c
+                prob += b6 >= pulp.lpSum(conds6) - (len(conds6) - 1)
+                penalties.append(CONFIG.get('PENALTY_REST_BLOCK_6PLUS', 1000) * b6)
+
+        for e in range(num_emp):
+            for d in holiday_dates:
+                objective_terms.append(CONFIG.get('REWARD_HOLIDAY_REST', 60) * (x[e][d][0] + x[e][d][4]))
+
+        prob += pulp.lpSum(objective_terms) - pulp.lpSum(penalties)
         return prob, x, y_d2
 
     prob, x, y_d2 = build_model()
@@ -328,7 +405,7 @@ def solve_schedule_with_pulp(file_path, prev_month_file_path=None):
     if pulp.LpStatus[status] in ['Optimal', 'Feasible']:
         print('🎉 解の導出に成功しました！最適シフト表を作成しました。\n')
     else:
-        print('❌ 解が見つかりません：条件が厳しすぎます（論理的な競合）。')
+        print('❌ 解が見つかりません：条件が厳しすぎます。')
         return
 
     out_file = os.path.join(get_base_path(), FILES.get('PULP_OUTPUT_FILE', 'Book1_PuLP診断版出力結果.xlsx'))
@@ -361,21 +438,19 @@ def solve_schedule_with_pulp(file_path, prev_month_file_path=None):
     wb_out.save(out_file)
     print(f'📁 中間シフト表の出力が完了しました: {out_file}\n')
 
-
-# ================= 3. シフト表役割後処理エンジン =================
+# ================= 3. 完整版角色后处理引擎 =================
 def post_process_schedule(input_file, output_file):
     input_file = os.path.join(get_base_path(), input_file)
     output_file = os.path.join(get_base_path(), output_file)
 
-    print("🚀 【シフト表役割後処理エンジン】を起動中...\n")
+    print("🚀 起動【排班表角色後処理エンジン (詳細解析版)】...\n")
     if not os.path.exists(input_file):
-        print(f"❌ 入力ファイルが見つかりません: [{input_file}]")
+        print(f"❌ 找不到入力ファイル: [{input_file}]")
         return
 
     wb = openpyxl.load_workbook(input_file)
     ws = wb[wb.sheetnames[0]]
 
-    # 構造解析
     name_col, team_col, day_start_col, header_row = None, None, None, None
     for r in range(1, 10):
         for c in range(1, 20):
@@ -384,44 +459,171 @@ def post_process_schedule(input_file, output_file):
             elif val == 'チーム': team_col = c
             elif str(val) == '1' and header_row and r == header_row: day_start_col = c
 
+    def is_holiday_check(d):
+        c = day_start_col + d
+        sample_cell = ws.cell(row=header_row + 1, column=c)
+        if sample_cell.fill and sample_cell.fill.start_color and sample_cell.fill.start_color.rgb:
+            if 'F4CC' in str(sample_cell.fill.start_color.rgb).upper(): return True
+        return (d % 7) in [4, 5]
+
     num_days = 30
-    holiday_dates = set(d for d in range(num_days) if (d % 7) in [4, 5]) # 簡易的な週末判定
+    holiday_dates = set(d for d in range(num_days) if is_holiday_check(d))
     trainees_set = set(CONFIG.get('TRAINEES', []))
 
-    noc_trainees, all_target_employees = [], []
+    noc_seniors, noc_trainees, csc_employees, all_target_employees = [], [], [], []
+    seen_employees = set()
+
     for r in range(header_row + 2, ws.max_row + 1):
         team = ws.cell(row=r, column=team_col).value
-        name = str(ws.cell(row=r, column=name_col).value or '').strip().replace(' ', '')
-        if team in ['NOC', 'CSC'] and name:
-            all_target_employees.append((name, r))
-            if team == 'NOC' and name in trainees_set:
-                noc_trainees.append((name, r))
+        raw_name = ws.cell(row=r, column=name_col).value
+        name = str(raw_name or '').strip().replace(' ', '').replace('\u3000', '').replace('\n', '')
 
-    # 実習生の在メ自動変換
-    trainee_matrix = {name: [str(ws.cell(row=r, column=day_start_col + d).value or '').strip() for d in range(num_days)] for name, r in noc_trainees}
-    total_converted = 0
+        if not name: continue
+        if name in seen_employees: break
+
+        if team in ['NOC', 'CSC']:
+            seen_employees.add(name)
+            all_target_employees.append((name, r))
+            if team == 'NOC':
+                if any(t in name for t in trainees_set) or name in trainees_set:
+                    noc_trainees.append((name, r))
+                else:
+                    noc_seniors.append((name, r))
+            elif team == 'CSC':
+                csc_employees.append((name, r))
+
+    print(f"📊 人員データ読み込み完了:")
+    print(f"   ├─ NOC正社員 ({len(noc_seniors)}名): {[n for n, _ in noc_seniors]}")
+    print(f"   ├─ NOC実習生 ({len(noc_trainees)}名): {[n for n, _ in noc_trainees]}")
+    print(f"   └─ CSC社員   ({len(csc_employees)}名): {[n for n, _ in csc_employees]}\n")
+
+    def get_consecutive_d_days(matrix, emp_name, current_day):
+        consecutive, day = 0, current_day
+        while day >= 0:
+            val = str(matrix[emp_name][day]).upper()
+            if any(k in val for k in ['D', 'D2', 'D3']):
+                consecutive += 1; day -= 1
+            else: break
+        return consecutive
+
+    # 1. NOC 正式员工角色分配
+    noc_counts = {name: {'メ': 0, '保全': 0, 'メ/保全': 0, 'total': 0} for name, _ in noc_seniors}
+    noc_last_day = {name: {'メ': -99, '保全': -99, 'メ/保全': -99, 'total': -99} for name, _ in noc_seniors}
+    noc_matrix = {name: [str(ws.cell(row=r, column=day_start_col + d).value or '').strip() for d in range(num_days)] for name, r in noc_seniors}
 
     for d in range(num_days):
-        working_trainees = [name for name, _ in noc_trainees if 'D' in str(trainee_matrix[name][d]).upper()]
+        d2_working_names = [name for name, _ in noc_seniors if 'D2' in noc_matrix[name][d]]
+        pure_d_working_names = [name for name, _ in noc_seniors if noc_matrix[name][d] == 'D']
+
+        for name in d2_working_names: noc_matrix[name][d] = 'D2'
+        d_count = len(pure_d_working_names)
+
+        def calc_noc_priority(emp_name):
+            cons_d = get_consecutive_d_days(noc_matrix, emp_name, d)
+            total_used = noc_counts[emp_name]['total']
+            bonus = 3.0 if cons_d >= 3 else (1.0 if cons_d == 2 else 0.0)
+            return -(bonus - (total_used * 1.2))
+
+        if d_count == 1:
+            noc_matrix[pure_d_working_names[0]][d] = 'D'
+        elif d_count == 2:
+            candidates = [(name, r) for name, r in noc_seniors if name in pure_d_working_names]
+            candidates.sort(key=lambda x: (calc_noc_priority(x[0]), noc_counts[x[0]]['total'], noc_counts[x[0]]['メ/保全'], -(d - noc_last_day[x[0]]['total'])))
+            combo_name, pure_d_name = candidates.pop(0)[0], candidates.pop(0)[0]
+            noc_matrix[combo_name][d] = 'メ/保全'
+            noc_matrix[pure_d_name][d] = 'D'
+            noc_counts[combo_name]['メ/保全'] += 1; noc_counts[combo_name]['total'] += 1
+            noc_last_day[combo_name]['メ/保全'] = d; noc_last_day[combo_name]['total'] = d
+        elif d_count >= 3:
+            candidates = [(name, r) for name, r in noc_seniors if name in pure_d_working_names]
+            candidates.sort(key=lambda x: (calc_noc_priority(x[0]), noc_counts[x[0]]['メ'], -(d - noc_last_day[x[0]]['total'])))
+            me_name = candidates.pop(0)[0]
+            noc_matrix[me_name][d] = 'メ'
+            noc_counts[me_name]['メ'] += 1; noc_counts[me_name]['total'] += 1
+            noc_last_day[me_name]['メ'] = d; noc_last_day[me_name]['total'] = d
+
+            candidates.sort(key=lambda x: (calc_noc_priority(x[0]), noc_counts[x[0]]['保全'], -(d - noc_last_day[x[0]]['total'])))
+            ho_name = candidates.pop(0)[0]
+            noc_matrix[ho_name][d] = '保全'
+            noc_counts[ho_name]['保全'] += 1; noc_counts[ho_name]['total'] += 1
+            noc_last_day[ho_name]['保全'] = d; noc_last_day[ho_name]['total'] = d
+
+            candidates.sort(key=lambda x: (get_consecutive_d_days(noc_matrix, x[0], d), -calc_noc_priority(x[0])))
+            primary_d_name = candidates.pop(0)[0]
+            noc_matrix[primary_d_name][d] = 'D'
+
+            for name, _ in candidates: noc_matrix[name][d] = 'タスク'
+
+    for name, r in noc_seniors:
+        for d in range(num_days): ws.cell(row=r, column=day_start_col + d).value = noc_matrix[name][d]
+
+    # 2. NOC 实习生 (Trainees) 角色转换
+    trainee_matrix = {name: [str(ws.cell(row=r, column=day_start_col + d).value or '').strip() for d in range(num_days)] for name, r in noc_trainees}
+    trainee_za_me_counts = {name: 0 for name, _ in noc_trainees}
+    total_converted_count = 0
+
+    for d in range(num_days):
+        working_trainees = [name for name, _ in noc_trainees if any(k in str(trainee_matrix[name][d]).upper() for k in ['D3', 'D'])]
         if len(working_trainees) > 2:
-            for name in working_trainees[2:]:
-                print(f"   ⚡ {d+1:2d} 日目: [{name}] を [在メ] に調整します")
+            overflow_count = len(working_trainees) - 2
+            working_trainees.sort(key=lambda x: (trainee_za_me_counts[x], -get_consecutive_d_days(trainee_matrix, x, d)))
+            for name in working_trainees[:overflow_count]:
+                print(f"   ⚡ 第 {d+1:2d} 日: 実習生出勤 {len(working_trainees)} 名 -> [{name}] を [在メ] に変換")
                 trainee_matrix[name][d] = '在メ'
-                total_converted += 1
+                trainee_za_me_counts[name] += 1
+                total_converted_count += 1
 
     for name, r in noc_trainees:
         for d in range(num_days): ws.cell(row=r, column=day_start_col + d).value = trainee_matrix[name][d]
 
-    # 週末のD2制限解除
+    # 3. CSC 团队后处理
+    csc_me_counts = {name: 0 for name, _ in csc_employees}
+    csc_last_me_day = {name: -99 for name, _ in csc_employees}
+    csc_matrix = {name: [str(ws.cell(row=r, column=day_start_col + d).value or '').strip() for d in range(num_days)] for name, r in csc_employees}
+
+    for d in range(num_days):
+        if d in holiday_dates: continue
+        assigned_me = [name for name, _ in csc_employees if csc_matrix[name][d] == 'メ']
+        d_candidates = [(name, r) for name, r in csc_employees if csc_matrix[name][d] == 'D']
+
+        if not assigned_me and len(d_candidates) >= 2:
+            def calc_csc_priority(emp_name):
+                cons_d = get_consecutive_d_days(csc_matrix, emp_name, d)
+                return -((2.5 if cons_d >= 3 else (1.0 if cons_d == 2 else 0.0)) - (csc_me_counts[emp_name] * 1.0))
+
+            d_candidates.sort(key=lambda x: (calc_csc_priority(x[0]), -(d - csc_last_me_day[x[0]])))
+            me_name = d_candidates[0][0]
+            csc_matrix[me_name][d] = 'メ'
+            csc_me_counts[me_name] += 1
+            csc_last_me_day[me_name] = d
+            d_candidates = [c for c in d_candidates if c[0] != me_name]
+
+        if len(d_candidates) >= 2:
+            d_candidates.sort(key=lambda x: -get_consecutive_d_days(csc_matrix, x[0], d))
+            for name, r in d_candidates[:-1]: csc_matrix[name][d] = '勤'
+
+    for name, r in csc_employees:
+        for d in range(num_days): ws.cell(row=r, column=day_start_col + d).value = csc_matrix[name][d]
+
+    # 4. 周末卡控
     for name, r in all_target_employees:
         for d in holiday_dates:
             cell = ws.cell(row=r, column=day_start_col + d)
-            if str(cell.value or '').strip() in ['D2', 'D2(メ)']:
-                cell.value = 'D'
+            if str(cell.value or '').strip() in ['D2', 'D2(メ)']: cell.value = 'D'
+
+    # 报告输出
+    print(f"\n📌 変換完了統計:")
+    print(f"   └─ 全月で【在メ】自動変換を {total_converted_count} 回実行しました。")
+
+    if noc_trainees:
+        print("\n📈 【NOC 実習生 在メ 割り当て公平性レポート】:")
+        for name, count in trainee_za_me_counts.items():
+            print(f"   - {name:8s}: 在メ = {count} 回")
 
     wb.save(output_file)
-    print(f"\n🎉 最終ファイルのエクスポートが完了しました: [{output_file}]")
-
+    print("\n" + "=" * 65)
+    print(f"🎉 最終ファイルの保存に成功しました: [{output_file}]")
+    print("=" * 65)
 
 # ================= 4. 実行コントロールセンター =================
 def main():
@@ -445,35 +647,27 @@ def main():
         final_out = FILES.get('FINAL_OUTPUT_FILE', 'Book1_最终完成版班表.xlsx')
 
         if choice == '1':
-            try:
-                fetch_and_split_sheets()
-                print(f"💡 【次へ】: [{target_file}] を微調してから、ステップ [2] を実行してください。")
+            try: fetch_and_split_sheets()
             except Exception as e: print(f"❌ エラー: {e}")
 
         elif choice == '2':
-            try:
-                solve_schedule_with_pulp(target_file, prev_file)
-                print(f"💡 【次へ】: [{pulp_out}] を確認し、問題なければステップ [3] を実行してください。")
+            try: solve_schedule_with_pulp(target_file, prev_file)
             except Exception as e: print(f"❌ エラー: {e}")
 
         elif choice == '3':
-            try:
-                post_process_schedule(pulp_out, final_out)
+            try: post_process_schedule(pulp_out, final_out)
             except Exception as e: print(f"❌ エラー: {e}")
 
         elif choice == '4':
-            print("\n🚀 全自動プロセスを開始します...")
             try:
                 fetch_and_split_sheets()
                 solve_schedule_with_pulp(target_file, prev_file)
                 post_process_schedule(pulp_out, final_out)
-            except Exception as e: print(f"\n❌ エラー: {e}")
+            except Exception as e: print(f"❌ エラー: {e}")
 
         elif choice == '0':
-            print("👋 プログラムを終了します。お疲れ様でした！")
+            print("👋 プログラムを終了します。")
             break
-        else:
-            print("⚠️ 無効な入力です。0〜4の番号を入力してください。")
 
 if __name__ == '__main__':
     main()
