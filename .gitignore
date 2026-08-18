@@ -1,0 +1,21 @@
+# Google API 凭证与 Token (绝对不能上传)
+credentials.json
+token_drive_exporter.json
+token_sheets_writer.json
+
+# Excel 表格数据
+*.xlsx
+~$*.xlsx
+
+# Jupyter Notebook 源文件及缓存
+*.ipynb
+.ipynb_checkpoints/
+
+# Mac 系统生成的缓存文件
+.DS_Store
+
+# Python 打包生成的中间文件夹
+__pycache__/
+build/
+dist/
+*.spec
