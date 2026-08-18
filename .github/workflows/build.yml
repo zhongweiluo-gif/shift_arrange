@@ -1,51 +1,63 @@
 name: Build Executables
 
 on:
-  workflow_dispatch:  
+  workflow_dispatch:
+  push:
+    branches:
+      - main
 
 jobs:
   build:
-    runs-on: ${{ matrix.os }}
     strategy:
       matrix:
         os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
 
     steps:
-    - name: Checkout Code
-      uses: actions/checkout@v4
+      - name: Checkout Code
+        uses: actions/checkout@v4
 
-    - name: Set up Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.10'
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
 
-    - name: Install Dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install -r requirements.txt
-        pip install pyinstaller
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
 
-    - name: Build with PyInstaller
-      run: pyinstaller --name "Shift_System" --onedir main.py
+      - name: Build with PyInstaller
+        run: |
+          pyinstaller --noconfirm --onedir --console --name "Shift_System" main.py
 
-    - name: Zip Build (Windows)
-      if: matrix.os == 'windows-latest'
-      run: Compress-Archive -Path dist\Shift_System -DestinationPath Shift_System_Windows.zip
+      - name: Fix CBC Executable Permissions (macOS)
+        if: matrix.os == 'macos-latest'
+        run: |
+          chmod +x dist/Shift_System/_internal/pulp/solverdir/cbc/osx/i64/cbc || true
+          chmod +x dist/Shift_System/Shift_System
 
-    - name: Zip Build (macOS)
-      if: matrix.os == 'macos-latest'
-      run: zip -r Shift_System_macOS.zip dist/Shift_System
+      - name: Zip Build (Windows)
+        if: matrix.os == 'windows-latest'
+        run: |
+          powershell Compress-Archive -Path dist/Shift_System/* -DestinationPath Windows-Build.zip
 
-    - name: Upload Artifact (Windows)
-      if: matrix.os == 'windows-latest'
-      uses: actions/upload-artifact@v4
-      with:
-        name: Windows-Build
-        path: Shift_System_Windows.zip
+      - name: Zip Build (macOS)
+        if: matrix.os == 'macos-latest'
+        run: |
+          cd dist && zip -r ../macOS-Build.zip Shift_System/
 
-    - name: Upload Artifact (macOS)
-      if: matrix.os == 'macos-latest'
-      uses: actions/upload-artifact@v4
-      with:
-        name: macOS-Build
-        path: Shift_System_macOS.zip
+      - name: Upload Artifact (Windows)
+        if: matrix.os == 'windows-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Windows-Build
+          path: Windows-Build.zip
+
+      - name: Upload Artifact (macOS)
+        if: matrix.os == 'macos-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: macOS-Build
+          path: macOS-Build.zip
