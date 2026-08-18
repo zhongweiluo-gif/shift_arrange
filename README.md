@@ -71,4 +71,25 @@ chmod -R +x /Path/To/Shift_System
 config.json（設定・パラメータ管理ファイル）
 
 credentials.json（Google Cloud Console の OAuth 2.0 認証ファイル）
+
+### 💡 実習生（トレーニー）がいない場合の `config.json` 設定方法
+
+当月に実習生（TRAINEES）がいない場合でも、メンターによる日勤サポート制度（D2役割の割り当て）を正しく機能させるために、以下の設定を行ってください：
+
+* **`TRAINEES`**: 空の配列 `[]` を指定します。
+* **`PRIMARY_MENTORS`**: **NOC メンバー全員の名前**をリストに入力してください。
+  *(※ 実習生がいない場合、D2役割を NOC 全員で順番にローテーションして担当させるために必要です)*
+* **`NIGHT_PARTNER_MAP`**: 空のオブジェクト `{}` を指定します。
+
+#### 📝 設定例 (実習生がいない月):
+```json
+{
+  "TRAINEES": [],
+  "PRIMARY_MENTORS": [
+    "佐藤太郎",
+    "藤原次郎",
+  ],
+  "NIGHT_PARTNER_MAP": {}
+}
+
 EOF
