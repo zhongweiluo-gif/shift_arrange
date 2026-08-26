@@ -101,7 +101,7 @@ def solve_schedule_with_pulp(file_path, prev_month_file_path=None):
     sheet_name = wb.sheetnames[0]
     ws = wb[sheet_name]
 
-    # ヘッダー位置解析および当月天数の自動算出
+    # ヘッダー位置解析
     name_col, team_col, day_start_col, header_row = None, None, None, None
     for r in range(1, 10):
         for c in range(1, 20):
@@ -110,22 +110,17 @@ def solve_schedule_with_pulp(file_path, prev_month_file_path=None):
             elif val == 'チーム': team_col = c
             elif str(val) == '1' and header_row and r == header_row: day_start_col = c
 
-    # 【修改点 1】动态计算当月的实际天数（判断表头 1, 2, 3... 直到非数字或空值）
+    # ✅ 【修复1】动态计算当月的实际天数（修复 31天/28天 Bug）
     num_days = 0
     if day_start_col and header_row:
-        c_check = day_start_col
         while True:
-            val = ws.cell(row=header_row, column=c_check).value
-            try:
-                if val is not None and int(str(val).strip()) == num_days + 1:
-                    num_days += 1
-                    c_check += 1
-                else:
-                    break
-            except ValueError:
+            v = ws.cell(row=header_row, column=day_start_col + num_days).value
+            if isinstance(v, (int, float)) or (isinstance(v, str) and v.isdigit()):
+                num_days += 1
+            else:
                 break
     if num_days == 0:
-        num_days = 30  # 保底默认值
+        num_days = 31  # 保底默认值
     print(f"📅 解析成功：本月实际天数为 【{num_days}】 天")
 
     target_rows, employees, teams, prefilled, red_border_cells = [], [], [], {}, set()
@@ -154,7 +149,6 @@ def solve_schedule_with_pulp(file_path, prev_month_file_path=None):
             teams.append(team)
 
             emp_idx = len(employees) - 1
-            # 【修改点 2】用 num_days 替换原有的固定 30
             for d in range(num_days):
                 c = day_start_col + d
                 cell = ws.cell(row=r, column=c)
@@ -182,47 +176,50 @@ def solve_schedule_with_pulp(file_path, prev_month_file_path=None):
                 if val == '名前': name_col_l = c; header_row_l = r
                 elif str(val) == '1' and header_row_l and r == header_row_l: day_start_col_l = c
 
+        # ✅ 【修复2】动态获取前月天数，确保完整读取排班记录
+        prev_num_days = 0
+        if day_start_col_l and header_row_l:
+            while True:
+                v = ws_lm.cell(row=header_row_l, column=day_start_col_l + prev_num_days).value
+                if isinstance(v, (int, float)) or (isinstance(v, str) and v.isdigit()):
+                    prev_num_days += 1
+                else:
+                    break
+
         lm_shifts_map = {}
         for r in range(header_row_l + 2, ws_lm.max_row + 1):
             raw_name = ws_lm.cell(row=r, column=name_col_l).value
             name = str(raw_name or '').strip().replace(' ', '').replace('\u3000', '')
             if name and name not in lm_shifts_map:
-                # 【修改点 3】根据前月实际天数读取前月所有排班
                 shifts_aug = []
-                d_c = day_start_col_l
-                while True:
-                    cell_v = ws_lm.cell(row=r, column=d_c).value
-                    h_v = ws_lm.cell(row=header_row_l, column=d_c).value
-                    if h_v is None or not str(h_v).strip().isdigit():
-                        break
-                    shifts_aug.append(str(cell_v or '').strip())
-                    d_c += 1
+                for d_aug in range(prev_num_days):
+                    val = ws_lm.cell(row=r, column=day_start_col_l + d_aug).value
+                    shifts_aug.append(str(val or '').strip())
                 lm_shifts_map[name] = shifts_aug
 
         for e, name in enumerate(employees):
             aug_shifts = lm_shifts_map.get(name, [])
-            # 【修改点 4】动态获取前月最后一天的班次与倒数5天记录
             aug31_val = aug_shifts[-1] if len(aug_shifts) > 0 else ''
             if aug31_val in ['N', 'N設置作業']: prev_month_aug31_night.add(e)
             elif aug31_val == '明': prev_month_aug31_ake.add(e)
             last5 = aug_shifts[-5:] if len(aug_shifts) >= 5 else ([''] * (5 - len(aug_shifts)) + aug_shifts)
             prev_month_last5_work[e] = [1 if is_work_shift_name(s) else 0 for s in last5]
 
+    # ✅ 【修复3】强化版RGB颜色判定（防止紫色/浅色被误判为红/粉）
     def is_red_or_pink_color(hex_color):
-        """祝日・赤日のセル色判定（紫色の除外）"""
         if not hex_color or len(hex_color) < 6: return False
         hex_rgb = hex_color[-6:].upper()
         if hex_rgb in ['FFFFFF', '000000', '00FFFFFF']: return False
         try:
             r, g, b = int(hex_rgb[0:2], 16), int(hex_rgb[2:4], 16), int(hex_rgb[4:6], 16)
-            if b > 210 and b >= r: return False
             if r > 180 and (r - g > 15) and (r - b > 15): return True
-            if any(kw in hex_rgb for kw in ['F4CC', 'C0CB', 'D9D9', 'ECEC', 'FFC0', 'FFD']): return True
-        except ValueError: pass
+            red_keywords = ['F4CC', 'C0CB', 'D9D9', 'ECEC', 'FFC0', 'FFD', 'FFA', 'FFC']
+            if any(kw in hex_rgb for kw in red_keywords): return True
+        except ValueError: 
+            pass
         return False
 
     def is_holiday_check(d):
-        """土日および赤日判定"""
         c = day_start_col + d
         if str(ws.cell(row=header_row + 1, column=c).value or '').strip() in ['土', '日', '土曜', '日曜', 'Sat', 'Sun']: return True
         for r_check in range(1, header_row + 3):
@@ -234,7 +231,7 @@ def solve_schedule_with_pulp(file_path, prev_month_file_path=None):
     holiday_dates = [d for d in range(num_days) if is_holiday_check(d)]
     target_public_rests = len(holiday_dates) if CONFIG.get('USE_DYNAMIC_PUBLIC_REST') else CONFIG.get('FIXED_PUBLIC_REST')
 
-    shifts = [0, 1, 2, 3, 4]  # 0:休, 1:D, 2:N, 3:明, 4:年
+    shifts = [0, 1, 2, 3, 4]  
     trainees = CONFIG.get('TRAINEES', [])
     primary_mentors = CONFIG.get('PRIMARY_MENTORS', [])
     night_partner_map = CONFIG.get('NIGHT_PARTNER_MAP', {})
@@ -245,12 +242,11 @@ def solve_schedule_with_pulp(file_path, prev_month_file_path=None):
     trainee_indices = [e for e in range(num_emp) if employees[e] in trainees]
     mentor_indices = [e for e in range(num_emp) if employees[e] in primary_mentors]
 
-    def build_model(diagnose_mode=False):
-        """数理最適化モデルの構築"""
+    def build_model():
         prob = pulp.LpProblem('Shift_Scheduling', pulp.LpMaximize)
         x = pulp.LpVariable.dicts('x', (range(num_emp), range(num_days), shifts), cat=pulp.LpBinary)
         y_d2 = pulp.LpVariable.dicts('y_d2', (mentor_indices, range(num_days)), cat=pulp.LpBinary) if mentor_indices else {}
-        penalties, diag_vars = [], {}
+        penalties = []
 
         # 1. 1日1シフト制約
         for e in range(num_emp):
@@ -339,7 +335,7 @@ def solve_schedule_with_pulp(file_path, prev_month_file_path=None):
                     prob += y_d2[m][d] + y_d2[m][d + 1] + y_d2[m][d + 2] - s_d2_dense <= 1
                     penalties.append(CONFIG.get('PENALTY_D2_DENSE', 15000) * s_d2_dense)
 
-        # 8d. 実習生夜勤時の専任メンター同行（マンツーマン）ペナルティ
+        # 8d. 実習生夜勤時の専任メンター同行
         for tr_name, mentor_name in night_partner_map.items():
             if tr_name in employees and mentor_name in employees:
                 tr_idx, m_idx = employees.index(tr_name), employees.index(mentor_name)
@@ -382,7 +378,6 @@ def solve_schedule_with_pulp(file_path, prev_month_file_path=None):
             if is_hol: prob += pulp.lpSum([x[e][d][2] for e in trainee_indices]) == 0
             else: prob += pulp.lpSum([x[e][d][2] for e in trainee_indices]) <= 1
 
-        # 直近7日間の夜勤上限緩和ペナルティ
         for e in range(num_emp):
             for d in range(num_days):
                 start_7 = max(0, d - 6)
@@ -390,7 +385,6 @@ def solve_schedule_with_pulp(file_path, prev_month_file_path=None):
                 prob += pulp.lpSum([x[e][d_i][2] for d_i in range(start_7, d + 1)]) - s_7_night <= 2
                 penalties.append(CONFIG.get('PENALTY_ROLLING_7DAY_NIGHT_OVER2', 1000) * s_7_night)
 
-        # 実習生の日勤（D3）人数制御
         for d in range(num_days):
             s_d3_over = pulp.LpVariable(f'slack_d3_over_{d}', lowBound=0, cat=pulp.LpInteger)
             prob += pulp.lpSum([x[e][d][1] for e in trainee_indices]) - s_d3_over <= 2
@@ -406,7 +400,6 @@ def solve_schedule_with_pulp(file_path, prev_month_file_path=None):
             return (x[e_idx][day_idx][0] + x[e_idx][day_idx][4]) if 0 <= day_idx < num_days else None
 
         for e in range(num_emp):
-            # 2連休評価
             for d in range(num_days - 1):
                 b2 = pulp.LpVariable(f'block_2_{e}_{d}', cat=pulp.LpBinary)
                 conds = [is_rest(e, d), is_rest(e, d + 1)]
@@ -417,7 +410,6 @@ def solve_schedule_with_pulp(file_path, prev_month_file_path=None):
                 prob += b2 >= pulp.lpSum(conds) - (len(conds) - 1)
                 objective_terms.append(CONFIG.get('REWARD_REST_BLOCK_2', 30) * b2)
 
-            # 3連休評価
             for d in range(num_days - 2):
                 b3 = pulp.LpVariable(f'block_3_{e}_{d}', cat=pulp.LpBinary)
                 conds = [is_rest(e, d), is_rest(e, d + 1), is_rest(e, d + 2)]
@@ -428,7 +420,6 @@ def solve_schedule_with_pulp(file_path, prev_month_file_path=None):
                 prob += b3 >= pulp.lpSum(conds) - (len(conds) - 1)
                 objective_terms.append(CONFIG.get('REWARD_REST_BLOCK_3', 40) * b3)
 
-            # 4連休以上評価
             for d in range(num_days - 3):
                 b4 = pulp.LpVariable(f'block_4plus_{e}_{d}', cat=pulp.LpBinary)
                 conds = [is_rest(e, d), is_rest(e, d + 1), is_rest(e, d + 2), is_rest(e, d + 3)]
@@ -436,7 +427,6 @@ def solve_schedule_with_pulp(file_path, prev_month_file_path=None):
                 prob += b4 >= pulp.lpSum(conds) - (len(conds) - 1)
                 objective_terms.append(CONFIG.get('REWARD_REST_BLOCK_4PLUS', 45) * b4)
 
-            # 6連休以上ペナルティ
             for d in range(num_days - 5):
                 b6 = pulp.LpVariable(f'block_6plus_{e}_{d}', cat=pulp.LpBinary)
                 conds6 = [is_rest(e, d + i) for i in range(6)]
@@ -444,7 +434,6 @@ def solve_schedule_with_pulp(file_path, prev_month_file_path=None):
                 prob += b6 >= pulp.lpSum(conds6) - (len(conds6) - 1)
                 penalties.append(CONFIG.get('PENALTY_REST_BLOCK_6PLUS', 1000) * b6)
 
-        # 祝日休暇の割り当て優遇
         for e in range(num_emp):
             for d in holiday_dates:
                 objective_terms.append(CONFIG.get('REWARD_HOLIDAY_REST', 60) * (x[e][d][0] + x[e][d][4]))
@@ -492,7 +481,6 @@ def solve_schedule_with_pulp(file_path, prev_month_file_path=None):
     wb_out = openpyxl.load_workbook(file_path)
     ws_out = wb_out[sheet_name]
 
-    # スタイル定義
     red_font = Font(color='FF0000')
     black_font = Font(color='000000')
     purple_fill = PatternFill(start_color='E6E6FA', end_color='E6E6FA', fill_type='solid')
@@ -535,22 +523,17 @@ def post_process_schedule(input_file, output_file):
             elif val == 'チーム': team_col = c
             elif str(val) == '1' and header_row and r == header_row: day_start_col = c
 
-    # 【修改点 5】后处理函数中同样动态检测月度天数
+    # ✅ 【修复4】后处理函数中同样动态检测月度天数
     num_days = 0
     if day_start_col and header_row:
-        c_check = day_start_col
         while True:
-            val = ws.cell(row=header_row, column=c_check).value
-            try:
-                if val is not None and int(str(val).strip()) == num_days + 1:
-                    num_days += 1
-                    c_check += 1
-                else:
-                    break
-            except ValueError:
+            v = ws.cell(row=header_row, column=day_start_col + num_days).value
+            if isinstance(v, (int, float)) or (isinstance(v, str) and v.isdigit()):
+                num_days += 1
+            else:
                 break
     if num_days == 0:
-        num_days = 30
+        num_days = 31
 
     def is_holiday_check(d):
         c = day_start_col + d
@@ -585,12 +568,8 @@ def post_process_schedule(input_file, output_file):
                 csc_employees.append((name, r))
 
     print(f"📊 人員データ読み込み完了 (天数: {num_days}天):")
-    print(f"   ├─ NOC正社員 ({len(noc_seniors)}名): {[n for n, _ in noc_seniors]}")
-    print(f"   ├─ NOC実習生 ({len(noc_trainees)}名): {[n for n, _ in noc_trainees]}")
-    print(f"   └─ CSC社員   ({len(csc_employees)}名): {[n for n, _ in csc_employees]}\n")
 
     def get_consecutive_d_days(matrix, emp_name, current_day):
-        """連続出勤日数のカウント"""
         consecutive, day = 0, current_day
         while day >= 0:
             val = str(matrix[emp_name][day]).upper()
@@ -599,7 +578,7 @@ def post_process_schedule(input_file, output_file):
             else: break
         return consecutive
 
-    # 1. NOC 正式社員の役割割り当て（メ/保全/タスク）
+    # 1. NOC 正式社員の役割割り当て
     noc_counts = {name: {'メ': 0, '保全': 0, 'メ/保全': 0, 'total': 0} for name, _ in noc_seniors}
     noc_last_day = {name: {'メ': -99, '保全': -99, 'メ/保全': -99, 'total': -99} for name, _ in noc_seniors}
     noc_matrix = {name: [str(ws.cell(row=r, column=day_start_col + d).value or '').strip() for d in range(num_days)] for name, r in noc_seniors}
@@ -647,6 +626,43 @@ def post_process_schedule(input_file, output_file):
 
             for name, _ in candidates: noc_matrix[name][d] = 'タスク'
 
+    # ✅ 【修复5】引入「削峰填谷」公平分配算法，实现「D ⇔ タスク」平准化
+    print("🔄 純Dの多すぎる人と少なすぎる人の「D ⇔ タスク」直接互換調整を開始します...")
+    swap_count = 0
+    while True:
+        d_totals = {name: sum(1 for d in range(num_days) if noc_matrix[name][d] == 'D') for name, _ in noc_seniors}
+        if not d_totals: break
+        
+        max_emp = max(d_totals, key=d_totals.get)
+        min_emp = min(d_totals, key=d_totals.get)
+        
+        if d_totals[max_emp] - d_totals[min_emp] <= 1:
+            break
+
+        swapped_in_this_loop = False
+        for d in range(num_days):
+            if noc_matrix[max_emp][d] == 'D':
+                task_candidates = [name for name, _ in noc_seniors if noc_matrix[name][d] == 'タスク']
+                if task_candidates:
+                    task_candidates.sort(key=lambda x: d_totals[x])
+                    target_task_emp = task_candidates[0]
+
+                    if d_totals[max_emp] - d_totals[target_task_emp] >= 2:
+                        noc_matrix[max_emp][d] = 'タスク'
+                        noc_matrix[target_task_emp][d] = 'D'
+                        swapped_in_this_loop = True
+                        swap_count += 1
+                        print(f"   ⚡ [{max_emp}](D={d_totals[max_emp]}) ⇔ [{target_task_emp}](D={d_totals[target_task_emp]}) 第 {d+1:2d} 日互換 (D ⇔ タスク)")
+                        break
+
+        if not swapped_in_this_loop:
+            print("   ⚠️ これ以上互換可能な日が存在しないため、最適化調整を終了します。")
+            break
+
+    print(f"✅ 削峰填谷完了: 合計 {swap_count} 回の [D ⇔ タスク] 互換を実行しました。\n")
+    # =====================================================================
+
+    # NOC角色写回 Excel
     for name, r in noc_seniors:
         for d in range(num_days): ws.cell(row=r, column=day_start_col + d).value = noc_matrix[name][d]
 
@@ -661,7 +677,6 @@ def post_process_schedule(input_file, output_file):
             overflow_count = len(working_trainees) - 2
             working_trainees.sort(key=lambda x: (trainee_za_me_counts[x], -get_consecutive_d_days(trainee_matrix, x, d)))
             for name in working_trainees[:overflow_count]:
-                print(f"   ⚡ 第 {d+1:2d} 日: 実習生出勤 {len(working_trainees)} 名 -> [{name}] を [在メ] に変換")
                 trainee_matrix[name][d] = '在メ'
                 trainee_za_me_counts[name] += 1
                 total_converted_count += 1
@@ -710,12 +725,10 @@ def post_process_schedule(input_file, output_file):
             cell = ws.cell(row=r, column=c)
             val = str(cell.value or '').strip()
 
-            # 休日・祝日の D2 クリア
             if d in holiday_dates and val in ['D2', 'D2(メ)']:
                 val = 'D'
                 cell.value = 'D'
 
-            # 役割に応じたセルの着色
             if val == '休':
                 cell.font = red_font
             elif val in ['N', '明']:
@@ -726,15 +739,6 @@ def post_process_schedule(input_file, output_file):
                 cell.font = black_font
             else:
                 cell.font = black_font
-
-    # レポート出力
-    print(f"\n📌 変換完了統計:")
-    print(f"   └─ 全月で【在メ】自動変換を {total_converted_count} 回実行しました。")
-
-    if noc_trainees:
-        print("\n📈 【NOC 実習生 在メ 割り当て公平性レポート】:")
-        for name, count in trainee_za_me_counts.items():
-            print(f"   - {name:8s}: 在メ = {count} 回")
 
     wb.save(output_file)
     print("\n" + "=" * 65)

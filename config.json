@@ -12,24 +12,21 @@
   "USE_DYNAMIC_PUBLIC_REST": true,
   "FIXED_PUBLIC_REST": 11,
   
-  "TRAINEES": [
-    "駱中威", 
-    "佐藤俊一郎", 
-    "大原和士"
-  ],
+  "TRAINEES": [],
   "PRIMARY_MENTORS": [
     "森川亘浩", 
     "今村孝", 
     "高田康平", 
     "檜垣優介", 
     "森下優", 
-    "小林朔也"
+    "小林朔也",
+    "駱中威", 
+    "佐藤俊一郎", 
+    "大原和士", 
+    "五十嵐康之", 
+    "ﾏﾝｻﾞﾆﾘｱﾘｶﾙﾄﾞ"
   ],
-  "NIGHT_PARTNER_MAP": {
-    "駱中威": "高田康平",
-    "佐藤俊一郎": "檜垣優介",
-    "大原和士": "森川亘浩"
-  },
+  "NIGHT_PARTNER_MAP": {},
 
   "REWARD_HOLIDAY_REST": 60,
   "REWARD_REST_BLOCK_2": 30,
