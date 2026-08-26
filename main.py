@@ -101,7 +101,7 @@ def solve_schedule_with_pulp(file_path, prev_month_file_path=None):
     sheet_name = wb.sheetnames[0]
     ws = wb[sheet_name]
 
-    # ヘッダー位置解析
+    # ヘッダー位置解析および当月天数の自動算出
     name_col, team_col, day_start_col, header_row = None, None, None, None
     for r in range(1, 10):
         for c in range(1, 20):
@@ -109,6 +109,24 @@ def solve_schedule_with_pulp(file_path, prev_month_file_path=None):
             if val == '名前': name_col = c; header_row = r
             elif val == 'チーム': team_col = c
             elif str(val) == '1' and header_row and r == header_row: day_start_col = c
+
+    # 【修改点 1】动态计算当月的实际天数（判断表头 1, 2, 3... 直到非数字或空值）
+    num_days = 0
+    if day_start_col and header_row:
+        c_check = day_start_col
+        while True:
+            val = ws.cell(row=header_row, column=c_check).value
+            try:
+                if val is not None and int(str(val).strip()) == num_days + 1:
+                    num_days += 1
+                    c_check += 1
+                else:
+                    break
+            except ValueError:
+                break
+    if num_days == 0:
+        num_days = 30  # 保底默认值
+    print(f"📅 解析成功：本月实际天数为 【{num_days}】 天")
 
     target_rows, employees, teams, prefilled, red_border_cells = [], [], [], {}, set()
 
@@ -136,7 +154,8 @@ def solve_schedule_with_pulp(file_path, prev_month_file_path=None):
             teams.append(team)
 
             emp_idx = len(employees) - 1
-            for d in range(30):
+            # 【修改点 2】用 num_days 替换原有的固定 30
+            for d in range(num_days):
                 c = day_start_col + d
                 cell = ws.cell(row=r, column=c)
                 val_str = str(cell.value).strip() if cell.value is not None else ''
@@ -168,15 +187,25 @@ def solve_schedule_with_pulp(file_path, prev_month_file_path=None):
             raw_name = ws_lm.cell(row=r, column=name_col_l).value
             name = str(raw_name or '').strip().replace(' ', '').replace('\u3000', '')
             if name and name not in lm_shifts_map:
-                shifts_aug = [str(ws_lm.cell(row=r, column=day_start_col_l + d).value or '').strip() for d in range(31)]
+                # 【修改点 3】根据前月实际天数读取前月所有排班
+                shifts_aug = []
+                d_c = day_start_col_l
+                while True:
+                    cell_v = ws_lm.cell(row=r, column=d_c).value
+                    h_v = ws_lm.cell(row=header_row_l, column=d_c).value
+                    if h_v is None or not str(h_v).strip().isdigit():
+                        break
+                    shifts_aug.append(str(cell_v or '').strip())
+                    d_c += 1
                 lm_shifts_map[name] = shifts_aug
 
         for e, name in enumerate(employees):
-            aug_shifts = lm_shifts_map.get(name, [''] * 31)
-            aug31_val = aug_shifts[30] if len(aug_shifts) >= 31 else ''
+            aug_shifts = lm_shifts_map.get(name, [])
+            # 【修改点 4】动态获取前月最后一天的班次与倒数5天记录
+            aug31_val = aug_shifts[-1] if len(aug_shifts) > 0 else ''
             if aug31_val in ['N', 'N設置作業']: prev_month_aug31_night.add(e)
             elif aug31_val == '明': prev_month_aug31_ake.add(e)
-            last5 = aug_shifts[26:31] if len(aug_shifts) >= 31 else [''] * 5
+            last5 = aug_shifts[-5:] if len(aug_shifts) >= 5 else ([''] * (5 - len(aug_shifts)) + aug_shifts)
             prev_month_last5_work[e] = [1 if is_work_shift_name(s) else 0 for s in last5]
 
     def is_red_or_pink_color(hex_color):
@@ -201,7 +230,7 @@ def solve_schedule_with_pulp(file_path, prev_month_file_path=None):
             if fill and fill.start_color and fill.start_color.rgb and is_red_or_pink_color(str(fill.start_color.rgb).upper()): return True
         return False
 
-    num_emp, num_days = len(employees), 30
+    num_emp = len(employees)
     holiday_dates = [d for d in range(num_days) if is_holiday_check(d)]
     target_public_rests = len(holiday_dates) if CONFIG.get('USE_DYNAMIC_PUBLIC_REST') else CONFIG.get('FIXED_PUBLIC_REST')
 
@@ -506,6 +535,23 @@ def post_process_schedule(input_file, output_file):
             elif val == 'チーム': team_col = c
             elif str(val) == '1' and header_row and r == header_row: day_start_col = c
 
+    # 【修改点 5】后处理函数中同样动态检测月度天数
+    num_days = 0
+    if day_start_col and header_row:
+        c_check = day_start_col
+        while True:
+            val = ws.cell(row=header_row, column=c_check).value
+            try:
+                if val is not None and int(str(val).strip()) == num_days + 1:
+                    num_days += 1
+                    c_check += 1
+                else:
+                    break
+            except ValueError:
+                break
+    if num_days == 0:
+        num_days = 30
+
     def is_holiday_check(d):
         c = day_start_col + d
         sample_cell = ws.cell(row=header_row + 1, column=c)
@@ -513,7 +559,6 @@ def post_process_schedule(input_file, output_file):
             if 'F4CC' in str(sample_cell.fill.start_color.rgb).upper(): return True
         return (d % 7) in [4, 5]
 
-    num_days = 30
     holiday_dates = set(d for d in range(num_days) if is_holiday_check(d))
     trainees_set = set(CONFIG.get('TRAINEES', []))
 
@@ -539,7 +584,7 @@ def post_process_schedule(input_file, output_file):
             elif team == 'CSC':
                 csc_employees.append((name, r))
 
-    print(f"📊 人員データ読み込み完了:")
+    print(f"📊 人員データ読み込み完了 (天数: {num_days}天):")
     print(f"   ├─ NOC正社員 ({len(noc_seniors)}名): {[n for n, _ in noc_seniors]}")
     print(f"   ├─ NOC実習生 ({len(noc_trainees)}名): {[n for n, _ in noc_trainees]}")
     print(f"   └─ CSC社員   ({len(csc_employees)}名): {[n for n, _ in csc_employees]}\n")
