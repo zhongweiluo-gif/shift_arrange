@@ -110,7 +110,7 @@ def solve_schedule_with_pulp(file_path, prev_month_file_path=None):
             elif val == 'チーム': team_col = c
             elif str(val) == '1' and header_row and r == header_row: day_start_col = c
 
-    # ✅ 【修复1】动态计算当月的实际天数（修复 31天/28天 Bug）
+    # 30日/31日などの月日数をヘッダーから動的に自動計算
     num_days = 0
     if day_start_col and header_row:
         while True:
@@ -120,13 +120,12 @@ def solve_schedule_with_pulp(file_path, prev_month_file_path=None):
             else:
                 break
     if num_days == 0:
-        num_days = 31  # 保底默认值
-    print(f"📅 解析成功：本月实际天数为 【{num_days}】 天")
+        num_days = 31
+    print(f"📅 当月の日数を自動判定しました: {num_days} 日間")
 
     target_rows, employees, teams, prefilled, red_border_cells = [], [], [], {}, set()
 
     def check_red_border(cell):
-        """赤枠（希望休）の判定"""
         border = cell.border
         if not border: return False
         for side in [border.left, border.right, border.top, border.bottom]:
@@ -176,7 +175,6 @@ def solve_schedule_with_pulp(file_path, prev_month_file_path=None):
                 if val == '名前': name_col_l = c; header_row_l = r
                 elif str(val) == '1' and header_row_l and r == header_row_l: day_start_col_l = c
 
-        # ✅ 【修复2】动态获取前月天数，确保完整读取排班记录
         prev_num_days = 0
         if day_start_col_l and header_row_l:
             while True:
@@ -205,7 +203,6 @@ def solve_schedule_with_pulp(file_path, prev_month_file_path=None):
             last5 = aug_shifts[-5:] if len(aug_shifts) >= 5 else ([''] * (5 - len(aug_shifts)) + aug_shifts)
             prev_month_last5_work[e] = [1 if is_work_shift_name(s) else 0 for s in last5]
 
-    # ✅ 【修复3】强化版RGB颜色判定（防止紫色/浅色被误判为红/粉）
     def is_red_or_pink_color(hex_color):
         if not hex_color or len(hex_color) < 6: return False
         hex_rgb = hex_color[-6:].upper()
@@ -247,6 +244,7 @@ def solve_schedule_with_pulp(file_path, prev_month_file_path=None):
         x = pulp.LpVariable.dicts('x', (range(num_emp), range(num_days), shifts), cat=pulp.LpBinary)
         y_d2 = pulp.LpVariable.dicts('y_d2', (mentor_indices, range(num_days)), cat=pulp.LpBinary) if mentor_indices else {}
         penalties = []
+        objective_terms = []
 
         # 1. 1日1シフト制約
         for e in range(num_emp):
@@ -290,19 +288,67 @@ def solve_schedule_with_pulp(file_path, prev_month_file_path=None):
             prob += pulp.lpSum([x[e][d][2] for e in csc_seniors]) == 1
             if d > 0: prob += pulp.lpSum([x[e][d][3] for e in all_seniors]) == 2
 
-        # 7. 月間夜勤・日勤回数の上下限
+        # 7. 月間夜勤・日勤回数の上下限 (✅ 修正：>= 2に戻す)
         for e in noc_seniors:
-            prob += pulp.lpSum([x[e][d][2] for d in range(num_days)]) >= 3
+            prob += pulp.lpSum([x[e][d][2] for d in range(num_days)]) >= 2
             prob += pulp.lpSum([x[e][d][2] for d in range(num_days)]) <= 4
             prob += pulp.lpSum([x[e][d][1] for d in range(num_days)]) >= 4
 
         for e in csc_seniors:
-            prob += pulp.lpSum([x[e][d][2] for d in range(num_days)]) >= 3
+            prob += pulp.lpSum([x[e][d][2] for d in range(num_days)]) >= 2
             prob += pulp.lpSum([x[e][d][2] for d in range(num_days)]) <= 5
 
         for e in trainee_indices:
-            prob += pulp.lpSum([x[e][d][2] for d in range(num_days)]) >= 3
+            prob += pulp.lpSum([x[e][d][2] for d in range(num_days)]) >= 2
             prob += pulp.lpSum([x[e][d][2] for d in range(num_days)]) <= 5
+
+        # =========================================================
+        # ✨ 7b. チーム内夜勤回数格差の最小化（削峰填谷：公平性の担保）
+        # =========================================================
+        noc_n_max = pulp.LpVariable('noc_n_max', lowBound=0, cat=pulp.LpInteger)
+        noc_n_min = pulp.LpVariable('noc_n_min', lowBound=0, cat=pulp.LpInteger)
+        for e in noc_seniors:
+            total_n_e = pulp.lpSum([x[e][d][2] for d in range(num_days)])
+            prob += total_n_e <= noc_n_max
+            prob += total_n_e >= noc_n_min
+        penalties.append(CONFIG.get('PENALTY_NIGHT_VARIANCE', 50000) * (noc_n_max - noc_n_min))
+
+        csc_n_max = pulp.LpVariable('csc_n_max', lowBound=0, cat=pulp.LpInteger)
+        csc_n_min = pulp.LpVariable('csc_n_min', lowBound=0, cat=pulp.LpInteger)
+        for e in csc_seniors:
+            total_n_e = pulp.lpSum([x[e][d][2] for d in range(num_days)])
+            prob += total_n_e <= csc_n_max
+            prob += total_n_e >= csc_n_min
+        penalties.append(CONFIG.get('PENALTY_NIGHT_VARIANCE', 50000) * (csc_n_max - csc_n_min))
+
+        # =========================================================
+        # ✨ 7c. 孤立休・孤立出勤の防止ペナルティ ＆ 5連休抑制
+        # =========================================================
+        def is_rest_var(e_idx, day_idx):
+            if 0 <= day_idx < num_days:
+                return x[e_idx][day_idx][0] + x[e_idx][day_idx][4]
+            return None
+
+        for e in range(num_emp):
+            for d in range(1, num_days - 1):
+                rest_prev = is_rest_var(e, d - 1)
+                rest_curr = is_rest_var(e, d)
+                rest_next = is_rest_var(e, d + 1)
+
+                s_iso_rest = pulp.LpVariable(f'iso_rest_{e}_{d}', cat=pulp.LpBinary)
+                prob += rest_curr - rest_prev - rest_next <= s_iso_rest
+                penalties.append(CONFIG.get('PENALTY_ISOLATED_REST', 10) * s_iso_rest)
+
+                s_iso_work = pulp.LpVariable(f'iso_work_{e}_{d}', cat=pulp.LpBinary)
+                prob += rest_prev + rest_next - rest_curr - 1 <= s_iso_work
+                penalties.append(CONFIG.get('PENALTY_ISOLATED_WORK', 10) * s_iso_work)
+
+            for d in range(num_days - 4):
+                prefilled_rests = sum(1 for i in range(5) if (e, d+i) in prefilled and prefilled[(e, d+i)] in ['休', '年'])
+                if prefilled_rests < 5:
+                    s_5_rest = pulp.LpVariable(f'slack_5_rest_{e}_{d}', cat=pulp.LpBinary)
+                    prob += pulp.lpSum([is_rest_var(e, d + i) for i in range(5)]) - s_5_rest <= 4
+                    penalties.append(CONFIG.get('PENALTY_REST_5_CONSECUTIVE', 100) * s_5_rest)
 
         # 8a. D2 メンター割り当て制約
         special_task_words = {'CPN\n設置作業日', 'CPN設置作業日', '保全', 'メ'}
@@ -368,7 +414,9 @@ def solve_schedule_with_pulp(file_path, prev_month_file_path=None):
             prob += noc_pure_d_sum - s_noc_over4 <= 3
             penalties.append(CONFIG.get('PENALTY_NOC_PURE_D_OVER3', 20000) * s_noc_over4)
 
-            if is_hol: prob += pulp.lpSum([x[e][d][1] for e in csc_seniors]) >= 1
+            # ✨ CSC の日勤制限 (✅ 修正：祝日は厳密に1名 == 1 に戻す)
+            if is_hol:
+                prob += pulp.lpSum([x[e][d][1] for e in csc_seniors]) == 1
             else:
                 prob += pulp.lpSum([x[e][d][1] for e in csc_seniors]) >= 1
                 s_csc_d2 = pulp.LpVariable(f'slack_csc_d2_{d}', lowBound=0, cat=pulp.LpInteger)
@@ -395,15 +443,11 @@ def solve_schedule_with_pulp(file_path, prev_month_file_path=None):
                 penalties.append(CONFIG.get('PENALTY_TRAINEE_HOLIDAY_D3', 30000) * x[tr][d][1])
 
         # 9. 目的関数（連休報酬および休日休みの優先評価）
-        objective_terms = []
-        def is_rest(e_idx, day_idx):
-            return (x[e_idx][day_idx][0] + x[e_idx][day_idx][4]) if 0 <= day_idx < num_days else None
-
         for e in range(num_emp):
             for d in range(num_days - 1):
                 b2 = pulp.LpVariable(f'block_2_{e}_{d}', cat=pulp.LpBinary)
-                conds = [is_rest(e, d), is_rest(e, d + 1)]
-                r_p, r_n = is_rest(e, d - 1), is_rest(e, d + 2)
+                conds = [is_rest_var(e, d), is_rest_var(e, d + 1)]
+                r_p, r_n = is_rest_var(e, d - 1), is_rest_var(e, d + 2)
                 if r_p is not None: conds.append(1 - r_p)
                 if r_n is not None: conds.append(1 - r_n)
                 for c in conds: prob += b2 <= c
@@ -412,8 +456,8 @@ def solve_schedule_with_pulp(file_path, prev_month_file_path=None):
 
             for d in range(num_days - 2):
                 b3 = pulp.LpVariable(f'block_3_{e}_{d}', cat=pulp.LpBinary)
-                conds = [is_rest(e, d), is_rest(e, d + 1), is_rest(e, d + 2)]
-                r_p, r_n = is_rest(e, d - 1), is_rest(e, d + 3)
+                conds = [is_rest_var(e, d), is_rest_var(e, d + 1), is_rest_var(e, d + 2)]
+                r_p, r_n = is_rest_var(e, d - 1), is_rest_var(e, d + 3)
                 if r_p is not None: conds.append(1 - r_p)
                 if r_n is not None: conds.append(1 - r_n)
                 for c in conds: prob += b3 <= c
@@ -422,17 +466,10 @@ def solve_schedule_with_pulp(file_path, prev_month_file_path=None):
 
             for d in range(num_days - 3):
                 b4 = pulp.LpVariable(f'block_4plus_{e}_{d}', cat=pulp.LpBinary)
-                conds = [is_rest(e, d), is_rest(e, d + 1), is_rest(e, d + 2), is_rest(e, d + 3)]
+                conds = [is_rest_var(e, d), is_rest_var(e, d + 1), is_rest_var(e, d + 2), is_rest_var(e, d + 3)]
                 for c in conds: prob += b4 <= c
                 prob += b4 >= pulp.lpSum(conds) - (len(conds) - 1)
                 objective_terms.append(CONFIG.get('REWARD_REST_BLOCK_4PLUS', 45) * b4)
-
-            for d in range(num_days - 5):
-                b6 = pulp.LpVariable(f'block_6plus_{e}_{d}', cat=pulp.LpBinary)
-                conds6 = [is_rest(e, d + i) for i in range(6)]
-                for c in conds6: prob += b6 <= c
-                prob += b6 >= pulp.lpSum(conds6) - (len(conds6) - 1)
-                penalties.append(CONFIG.get('PENALTY_REST_BLOCK_6PLUS', 1000) * b6)
 
         for e in range(num_emp):
             for d in holiday_dates:
@@ -523,7 +560,6 @@ def post_process_schedule(input_file, output_file):
             elif val == 'チーム': team_col = c
             elif str(val) == '1' and header_row and r == header_row: day_start_col = c
 
-    # ✅ 【修复4】后处理函数中同样动态检测月度天数
     num_days = 0
     if day_start_col and header_row:
         while True:
@@ -626,7 +662,6 @@ def post_process_schedule(input_file, output_file):
 
             for name, _ in candidates: noc_matrix[name][d] = 'タスク'
 
-    # ✅ 【修复5】引入「削峰填谷」公平分配算法，实现「D ⇔ タスク」平准化
     print("🔄 純Dの多すぎる人と少なすぎる人の「D ⇔ タスク」直接互換調整を開始します...")
     swap_count = 0
     while True:
@@ -660,9 +695,7 @@ def post_process_schedule(input_file, output_file):
             break
 
     print(f"✅ 削峰填谷完了: 合計 {swap_count} 回の [D ⇔ タスク] 互換を実行しました。\n")
-    # =====================================================================
 
-    # NOC角色写回 Excel
     for name, r in noc_seniors:
         for d in range(num_days): ws.cell(row=r, column=day_start_col + d).value = noc_matrix[name][d]
 
