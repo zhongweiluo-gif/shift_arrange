@@ -216,6 +216,55 @@ def solve_schedule_with_pulp(file_path, prev_month_file_path=None):
     trainee_indices = [e for e in range(num_emp) if employees[e] in trainees]
     mentor_indices = [e for e in range(num_emp) if employees[e] in primary_mentors]
 
+    # =========================================================================
+    # ✨ プレチェック (Pre-check Engine) の復元
+    # =========================================================================
+    print("🔍 超高速 Python 事前デッドロック検知（プレチェック）を実行中...")
+    fatal_errors = []
+
+    for e in range(num_emp):
+        rest_count = sum(1 for d in range(num_days) if (e, d) in prefilled and prefilled[(e, d)] in ['休', '年'])
+        if rest_count > target_public_rests:
+            fatal_errors.append(f"❌ 【公休超過エラー】{employees[e]} (チーム:{teams[e]}): 事前入力された休みが {rest_count} 日あり、当月の公休上限({target_public_rests}日)を超過しています！")
+
+    for d in range(num_days):
+        is_hol = d in holiday_dates
+        noc_avail = sum(1 for e in noc_seniors if not ((e, d) in prefilled and prefilled[(e, d)] in ['休', '年']))
+        csc_avail = sum(1 for e in csc_seniors if not ((e, d) in prefilled and prefilled[(e, d)] in ['休', '年']))
+        noc_req = 2 if is_hol else 3 
+        csc_req = 1 if is_hol else 2 
+        if noc_avail < noc_req:
+            fatal_errors.append(f"❌ 【出勤人数不足エラー】第 {d+1} 日: NOCチームの出勤可能人数が {noc_avail} 名しかいません（最低 {noc_req} 名必要です）。")
+        if csc_avail < csc_req:
+            fatal_errors.append(f"❌ 【出勤人数不足エラー】第 {d+1} 日: CSCチームの出勤可能人数が {csc_avail} 名しかいません（最低 {csc_req} 名必要です）。")
+
+    for e in range(num_emp):
+        if e in prev_month_aug31_night and (e, 0) in prefilled and prefilled[(e, 0)] != '明':
+            fatal_errors.append(f"❌ 【シフト遷移エラー】{employees[e]}: 前月最終日が夜勤(N)ですが、当月1日が「明」以外で固定されています！")
+        if e in prev_month_aug31_ake and (e, 0) in prefilled and prefilled[(e, 0)] not in ['休', '年']:
+            fatal_errors.append(f"❌ 【シフト遷移エラー】{employees[e]}: 前月最終日が明け(明)ですが、当月1日が「休/年」以外で固定されています！")
+        last5_hist = prev_month_last5_work.get(e, [0]*5)
+        for m in range(1, 6):
+            if sum(last5_hist[5-(6-m):5]) + sum(1 for di in range(m) if (e, di) in prefilled and is_work_shift_name(prefilled[(e, di)])) > 5:
+                fatal_errors.append(f"❌ 【6連勤エラー】{employees[e]}: 前月からの連続出勤により、月初に6連勤が発生する事前入力があります！")
+        for d in range(num_days - 1):
+            if (e, d) in prefilled and prefilled[(e, d)] in ['N', 'N設置作業']:
+                if (e, d+1) in prefilled and prefilled[(e, d+1)] != '明':
+                    fatal_errors.append(f"❌ 【シフト遷移エラー】{employees[e]}: 第 {d+1} 日が夜勤(N)ですが、翌日が「明」以外で固定されています！")
+            if (e, d) in prefilled and prefilled[(e, d)] == '明':
+                if (e, d+1) in prefilled and prefilled[(e, d+1)] not in ['休', '年']:
+                    fatal_errors.append(f"❌ 【シフト遷移エラー】{employees[e]}: 第 {d+1} 日が明け(明)ですが、翌日が休み以外で固定されています！")
+
+    if fatal_errors:
+        print("\n" + "="*65)
+        print("🚨 プレチェック未通過！以下の絶対不可避な矛盾が検出されました（Excelの希望休等を修正してください）:")
+        for err in set(fatal_errors):
+            print(err)
+        print("="*65 + "\n")
+        return  # ここで実行を中断し、デッドロックによる空転を防ぎます
+
+    print("✅ プレチェック通過！深刻なデッドロックは見つかりませんでした。モデル構築を開始します...\n")
+
     def build_model():
         prob = pulp.LpProblem('Shift_Scheduling', pulp.LpMaximize)
         x = pulp.LpVariable.dicts('x', (range(num_emp), range(num_days), shifts), cat=pulp.LpBinary)
@@ -590,8 +639,8 @@ def post_process_schedule(input_file, output_file):
             for name in pure_d_candidates[1:]:
                 noc_matrix[name][d] = "タスク"
 
-    # ================= 3. ✨ 純D峰值互换平理エンジン (削峰填谷) =================
-    print("🔄 純Dの多すぎる人と少なすぎる人の「D ⇔ タスク」直接互換調整を開始します...")
+    # ================= 3. NOC 純D峰値互換平坦化エンジン (削峰填谷) =================
+    print("🔄 [NOC] 純Dの多すぎる人と少なすぎる人の「D ⇔ タスク」直接互換調整を開始します...")
     swap_count = 0
 
     while True:
@@ -615,14 +664,14 @@ def post_process_schedule(input_file, output_file):
                         noc_matrix[target_task_emp][d] = "D"
                         swapped_in_this_loop = True
                         swap_count += 1
-                        print(f"   ⚡ [{max_emp}](D={d_totals[max_emp]}) ⇔ [{target_task_emp}](D={d_totals[target_task_emp]}) 第 {d+1:2d} 日互換 (D ⇔ タスク)")
+                        print(f"   ⚡ NOC: [{max_emp}](D={d_totals[max_emp]}) ⇔ [{target_task_emp}](D={d_totals[target_task_emp]}) 第 {d+1:2d} 日互換 (D ⇔ タスク)")
                         break
 
         if not swapped_in_this_loop:
-            print("   ⚠️ これ以上互換可能な日が存在しないため、最適化調整を終了します。")
+            print("   ⚠️ NOC: これ以上互換可能な日が存在しないため、最適化調整を終了します。")
             break
 
-    print(f"✅ 削峰填谷完了: 合計 {swap_count} 回の [D ⇔ タスク] 互換を実行しました。\n")
+    print(f"✅ NOC 削峰填谷完了: 合計 {swap_count} 回の [D ⇔ タスク] 互換を実行しました。\n")
 
     for name, r in noc_seniors:
         for d in range(num_days):
@@ -645,11 +694,52 @@ def post_process_schedule(input_file, output_file):
             csc_matrix[name][d] = "勤"
             csc_counts[name]["勤"] += 1
 
+    # =========================================================================
+    # ✨ CSC 削峰填谷 (Peak-shaving / Valley-filling) の復元
+    # =========================================================================
+    print("🔄 [CSC] 純Dの多すぎる人と少なすぎる人の「D ⇔ 勤」直接互換調整を開始します...")
+    csc_swap_count = 0
+
+    while True:
+        d_totals = {name: sum(1 for d in range(num_days) if csc_matrix[name][d] == "D") for name, _ in csc_employees}
+        if not d_totals: break
+
+        max_emp = max(d_totals, key=d_totals.get)
+        min_emp = min(d_totals, key=d_totals.get)
+
+        if d_totals[max_emp] - d_totals[min_emp] <= 1:
+            break
+
+        swapped_in_this_loop = False
+        for d in range(num_days):
+            if d in holiday_dates: continue
+
+            if csc_matrix[max_emp][d] == "D":
+                kin_candidates = [name for name, _ in csc_employees if csc_matrix[name][d] == "勤"]
+                if kin_candidates:
+                    kin_candidates.sort(key=lambda x: d_totals[x])
+                    target_kin_emp = kin_candidates[0]
+
+                    if d_totals[max_emp] - d_totals[target_kin_emp] >= 2:
+                        csc_matrix[max_emp][d] = "勤"
+                        csc_matrix[target_kin_emp][d] = "D"
+                        swapped_in_this_loop = True
+                        csc_swap_count += 1
+                        print(f"    ⚡ CSC: [{max_emp}](D={d_totals[max_emp]}) ⇔ [{target_kin_emp}](D={d_totals[target_kin_emp]}) 第 {d+1:2d} 日 (D ⇔ 勤)")
+                        break
+
+        if not swapped_in_this_loop:
+            print("    ⚠️ CSC: これ以上互換可能な日が存在しないため調整を終了します。")
+            break
+
+    print(f"✅ CSC 削峰填谷完了: 合計 {csc_swap_count} 回実行。\n")
+
     for name, r in csc_employees:
         for d in range(num_days):
             ws.cell(row=r, column=day_start_col + d).value = csc_matrix[name][d]
 
-    # レポートサマリー出力
+    # ================= レポートサマリー出力 =================
+    # NOC レポート
     final_report = {name: {"純D": 0, "メ": 0, "保全": 0, "メ/保全": 0, "タスク": 0} for name, _ in noc_seniors}
     for name, _ in noc_seniors:
         for d in range(num_days):
@@ -666,7 +756,26 @@ def post_process_schedule(input_file, output_file):
     print("-" * 60)
     for name, counts in final_report.items():
         print(f"{name:10s} | {counts['純D']:4d} | {counts['メ']:4d} | {counts['保全']:4d} | {counts['メ/保全']:7d} | {counts['タスク']:4d}")
-    print("-" * 60)
+    print("-" * 60 + "\n")
+
+    # =========================================================================
+    # ✨ CSC 公平性レポート の復元
+    # =========================================================================
+    csc_report = {name: {"純D": 0, "メ": 0, "勤": 0} for name, _ in csc_employees}
+    for name, _ in csc_employees:
+        for d in range(num_days):
+            val = csc_matrix[name][d]
+            if val == "D": csc_report[name]["純D"] += 1
+            elif val == "メ": csc_report[name]["メ"] += 1
+            elif val == "勤": csc_report[name]["勤"] += 1
+
+    print("📈【CSC 役割分配の最終公平性レポート】:")
+    print("-" * 50)
+    print(f"{'名前':<10s} | {'純D':<4s} | {'メ':<4s} | {'勤':<4s}")
+    print("-" * 50)
+    for name, counts in csc_report.items():
+        print(f"{name:10s} | {counts['純D']:4d} | {counts['メ']:4d} | {counts['勤']:4d}")
+    print("-" * 50 + "\n")
 
     # 最終スタイル適用
     red_font = Font(color='FF0000')
@@ -687,7 +796,7 @@ def post_process_schedule(input_file, output_file):
             else: cell.font = black_font
 
     wb.save(output_file)
-    print("\n" + "=" * 65)
+    print("=" * 65)
     print(f"🎉 シフト表の役割削峰填谷処理が完了しました。保存先: [{output_file}]")
     print("=" * 65)
 
