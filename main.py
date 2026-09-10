@@ -503,11 +503,12 @@ def solve_schedule_with_cpsat(file_path, prev_month_file_path=None):
     solver.parameters.relative_gap_limit = 0.01
     solver.parameters.log_search_progress = False
 
-    # ✨ 10秒ごとの生存確認（ハートビート）対応ロガー
+    # ✨【完全修正】新解発見ログ ＆ 10秒ごとの生存確認（ハートビート）ロガー
     class CleanJapaneseLogger(cp_model.CpSolverSolutionCallback):
         def __init__(self):
             cp_model.CpSolverSolutionCallback.__init__(self)
             self.__solution_count = 0
+            self.__start_time = time.time()
             self.__last_print_time = time.time()
             self.__last_obj_val = None
             self.__last_gap = None
@@ -526,17 +527,32 @@ def solve_schedule_with_cpsat(file_path, prev_month_file_path=None):
             
             print(f"⏱️ [{time_spent:5.1f}秒] 発見した解 #{self.__solution_count:<3} | スコア: {int(obj_val):>10} 点 | 残りGap: {gap:5.2f}%")
 
-        # 定期的な進捗チェック（10秒経過判定用）
+        # 外部から10秒間隔でチェックをかける関数
         def check_heartbeat(self):
-            current_clock = time.time()
-            if current_clock - self.__last_print_time >= 10.0 and self.__solution_count > 0:
-                self.__last_print_time = current_clock
-                print(f"⏳ (10秒経過 - 探索継続中...) 解 #{self.__solution_count} 保持中 | 最新スコア: {int(self.__last_obj_val):>10} 点 | 残りGap: {self.__last_gap:5.2f}%")
+            if self.__solution_count > 0:
+                current_clock = time.time()
+                if current_clock - self.__last_print_time >= 10.0:
+                    self.__last_print_time = current_clock
+                    elapsed = current_clock - self.__start_time
+                    print(f"⏳ ({int(elapsed)}秒経過 - 探索継続中...) 最新スコア: {int(self.__last_obj_val):>10} 点 | 残りGap: {self.__last_gap:5.2f}%")
 
     logger = CleanJapaneseLogger()
     print(f"⚡ 高性能 Google CP-SAT ソルバー実行中 (スレッド: {threads_count}, 目標Gap <= 1.00%)...\n")
     
+    # 探索中に並行して10秒ヘルスチェックを行うための非非同期スレッドを適用
+    import threading
+    stop_event = threading.Event()
+
+    def heartbeat_timer():
+        while not stop_event.is_set():
+            time.sleep(1)
+            logger.check_heartbeat()
+
+    timer_thread = threading.Thread(target=heartbeat_timer, daemon=True)
+    timer_thread.start()
+
     status = solver.Solve(model, logger)
+    stop_event.set()
 
     if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         print('\n' + '=' * 65)
@@ -889,7 +905,6 @@ def post_process_schedule(input_file, output_file):
 
 
 # ================= 4. メインメニュー =================
-# ================= 4. メインメニュー =================
 def main():
     while True:
         print("\n" + "=" * 50)
@@ -905,38 +920,30 @@ def main():
 
         choice = input("👉 実行したいステップの番号を入力してください: ").strip()
 
-        # ✨【重要】config.json の設定値からファイル名を動的に取得
         target_file = FILES.get('TARGET_LOCAL_FILE', 'Book1.xlsx')
         prev_file = FILES.get('PREV_LOCAL_FILE', 'BookLM.xlsx')
-        cpsat_out = FILES.get('PULP_OUTPUT_FILE', 'Book1_出力結果.xlsx')
+        pulp_out = FILES.get('PULP_OUTPUT_FILE', 'Book1_出力結果.xlsx')
         final_out = FILES.get('FINAL_OUTPUT_FILE', 'Book1_最終完成版シフト表.xlsx')
 
         if choice == '1':
-            try: 
-                fetch_and_split_sheets()
-            except Exception as e: 
-                print(f"❌ エラー: {e}")
+            try: fetch_and_split_sheets()
+            except Exception as e: print(f"❌ エラー: {e}")
         elif choice == '2':
-            try: 
-                solve_schedule_with_cpsat(target_file, prev_file)
-            except Exception as e: 
-                print(f"❌ エラー: {e}")
+            try: solve_schedule_with_cpsat(target_file, prev_file)
+            except Exception as e: print(f"❌ エラー: {e}")
         elif choice == '3':
-            try: 
-                # ✨ 生成された中間ファイル(Book1_出力結果.xlsx)を読み込んで最終版(Book1_最終完成版シフト表.xlsx)を出力
-                post_process_schedule(cpsat_out, final_out)
-            except Exception as e: 
-                print(f"❌ エラー: {e}")
+            try: post_process_schedule(pulp_out, final_out)
+            except Exception as e: print(f"❌ エラー: {e}")
         elif choice == '4':
             try:
                 fetch_and_split_sheets()
                 solve_schedule_with_cpsat(target_file, prev_file)
-                post_process_schedule(cpsat_out, final_out)
-            except Exception as e: 
-                print(f"❌ エラー: {e}")
+                post_process_schedule(pulp_out, final_out)
+            except Exception as e: print(f"❌ エラー: {e}")
         elif choice == '0':
             print("👋 プログラムを終了します。")
             break
+
 
 if __name__ == '__main__':
     main()
