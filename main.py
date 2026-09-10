@@ -889,6 +889,7 @@ def post_process_schedule(input_file, output_file):
 
 
 # ================= 4. メインメニュー =================
+# ================= 4. メインメニュー =================
 def main():
     while True:
         print("\n" + "=" * 50)
@@ -904,30 +905,38 @@ def main():
 
         choice = input("👉 実行したいステップの番号を入力してください: ").strip()
 
+        # ✨【重要】config.json の設定値からファイル名を動的に取得
         target_file = FILES.get('TARGET_LOCAL_FILE', 'Book1.xlsx')
         prev_file = FILES.get('PREV_LOCAL_FILE', 'BookLM.xlsx')
-        pulp_out = FILES.get('PULP_OUTPUT_FILE', 'Book1_出力結果.xlsx')
+        cpsat_out = FILES.get('PULP_OUTPUT_FILE', 'Book1_出力結果.xlsx')
         final_out = FILES.get('FINAL_OUTPUT_FILE', 'Book1_最終完成版シフト表.xlsx')
 
         if choice == '1':
-            try: fetch_and_split_sheets()
-            except Exception as e: print(f"❌ エラー: {e}")
+            try: 
+                fetch_and_split_sheets()
+            except Exception as e: 
+                print(f"❌ エラー: {e}")
         elif choice == '2':
-            try: solve_schedule_with_cpsat(target_file, prev_file)
-            except Exception as e: print(f"❌ エラー: {e}")
+            try: 
+                solve_schedule_with_cpsat(target_file, prev_file)
+            except Exception as e: 
+                print(f"❌ エラー: {e}")
         elif choice == '3':
-            try: post_process_schedule(pulp_out, final_out)
-            except Exception as e: print(f"❌ エラー: {e}")
+            try: 
+                # ✨ 生成された中間ファイル(Book1_出力結果.xlsx)を読み込んで最終版(Book1_最終完成版シフト表.xlsx)を出力
+                post_process_schedule(cpsat_out, final_out)
+            except Exception as e: 
+                print(f"❌ エラー: {e}")
         elif choice == '4':
             try:
                 fetch_and_split_sheets()
                 solve_schedule_with_cpsat(target_file, prev_file)
-                post_process_schedule(pulp_out, final_out)
-            except Exception as e: print(f"❌ エラー: {e}")
+                post_process_schedule(cpsat_out, final_out)
+            except Exception as e: 
+                print(f"❌ エラー: {e}")
         elif choice == '0':
             print("👋 プログラムを終了します。")
             break
-
 
 if __name__ == '__main__':
     main()
