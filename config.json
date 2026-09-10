@@ -14,25 +14,30 @@
   
   "TRAINEES": [],
   "PRIMARY_MENTORS": [
-    "森川亘浩", 
-    "今村孝", 
-    "高田康平", 
-    "檜垣優介", 
-    "森下優", 
-    "小林朔也",
-    "駱中威", 
-    "佐藤俊一郎", 
-    "大原和士", 
-    "五十嵐康之", 
-    "ﾏﾝｻﾞﾆﾘｱﾘｶﾙﾄﾞ"
+    "森川亘浩", "今村孝", "高田康平", "檜垣優介", "森下優", "小林朔也",
+    "駱中威", "佐藤俊一郎", "大原和士", "五十嵐康之", "ﾏﾝｻﾞﾆﾘｱﾘｶﾙﾄﾞ"
   ],
-  "NIGHT_PARTNER_MAP": {},
+
+  "NEEDS_NIGHT_SUPPORT": ["駱中威", "佐藤俊一郎", "大原和士"],
+  "NIGHT_SUPPORT_POOL": {
+    "駱中威": ["森下優", "小林朔也"],
+    "佐藤俊一郎": ["森下優", "小林朔也"],
+    "大原和士": ["森川亘浩", "今村孝", "高田康平", "檜垣優介", "森下優", "小林朔也", "五十嵐康之", "ﾏﾝｻﾞﾆﾘｱﾘｶﾙﾄﾞ"]
+  },
+
+  "LIMIT_NOC_NIGHT_MAX": 4,
+  "LIMIT_CSC_NIGHT_MAX": 6,
+  "SUPPORT_NIGHT_TARGET": 3,
 
   "REWARD_HOLIDAY_REST": 60,
   "REWARD_REST_BLOCK_2": 30,
   "REWARD_REST_BLOCK_3": 40,
   "REWARD_REST_BLOCK_4PLUS": 45,
 
+  "PENALTY_REST_5_CONSECUTIVE": 100,
+  "PENALTY_ISOLATED_REST": 10,
+  "PENALTY_ISOLATED_WORK": 10,
+  "PENALTY_NIGHT_VARIANCE": 50000,
   "PENALTY_NIGHT_PARTNER_MISSING": 50000,
   "PENALTY_NIGHT_GAP_TIGHT": 50000,
   "PENALTY_CSC_WEEKDAY_D_SHORT": 50000,

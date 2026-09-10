@@ -80,7 +80,7 @@ def solve_schedule_with_pulp(file_path, prev_month_file_path=None):
     if prev_month_file_path:
         prev_month_file_path = os.path.join(get_base_path(), prev_month_file_path)
 
-    print("🚀 【PuLP + HiGHS 数理最適化ソルバー】を起動中...\n")
+    print("🚀 【PuLP + HiGHS 数理最適化ソルバー (夜勤サポート対応版)】を起動中...\n")
     if not os.path.exists(file_path):
         print(f"❌ 指定されたファイルが見つかりません: [{file_path}]")
         return
@@ -208,7 +208,6 @@ def solve_schedule_with_pulp(file_path, prev_month_file_path=None):
     shifts = [0, 1, 2, 3, 4]  
     trainees = CONFIG.get('TRAINEES', [])
     primary_mentors = CONFIG.get('PRIMARY_MENTORS', [])
-    night_partner_map = CONFIG.get('NIGHT_PARTNER_MAP', {})
 
     noc_seniors = [e for e in range(num_emp) if teams[e] == 'NOC' and employees[e] not in trainees]
     csc_seniors = [e for e in range(num_emp) if teams[e] == 'CSC' and employees[e] not in trainees]
@@ -216,9 +215,7 @@ def solve_schedule_with_pulp(file_path, prev_month_file_path=None):
     trainee_indices = [e for e in range(num_emp) if employees[e] in trainees]
     mentor_indices = [e for e in range(num_emp) if employees[e] in primary_mentors]
 
-    # =========================================================================
-    # ✨ プレチェック (Pre-check Engine) の復元
-    # =========================================================================
+    # ✨ プレチェック
     print("🔍 超高速 Python 事前デッドロック検知（プレチェック）を実行中...")
     fatal_errors = []
 
@@ -261,7 +258,7 @@ def solve_schedule_with_pulp(file_path, prev_month_file_path=None):
         for err in set(fatal_errors):
             print(err)
         print("="*65 + "\n")
-        return  # ここで実行を中断し、デッドロックによる空転を防ぎます
+        return
 
     print("✅ プレチェック通過！深刻なデッドロックは見つかりませんでした。モデル構築を開始します...\n")
 
@@ -279,7 +276,11 @@ def solve_schedule_with_pulp(file_path, prev_month_file_path=None):
                 prob += pulp.lpSum([x[e][d][s] for s in shifts]) == 1
                 if (e, d) in prefilled:
                     val = prefilled[(e, d)]
-                    if val in shift_map: prob += x[e][d][shift_map[val]] == 1
+                    if val in shift_map:
+                        prob += x[e][d][shift_map[val]] == 1
+                    else:
+                        if (e, d) in red_border_cells: prob += x[e][d][0] == 1 
+                        else: prob += x[e][d][1] == 1 
                 else:
                     prob += x[e][d][4] == 0
 
@@ -289,9 +290,7 @@ def solve_schedule_with_pulp(file_path, prev_month_file_path=None):
         for e in range(num_emp):
             if e in prev_month_aug31_night: prob += x[e][0][3] == 1
             elif (e, 0) not in prefilled or prefilled[(e, 0)] != '明': prob += x[e][0][3] == 0
-
             if e in prev_month_aug31_ake and (e, 0) not in prefilled: prob += x[e][0][0] + x[e][0][4] == 1
-
             for d in range(num_days - 1):
                 prob += x[e][d + 1][3] == x[e][d][2]
                 if (e, d + 1) not in prefilled: prob += x[e][d + 1][0] + x[e][d + 1][4] >= x[e][d][3]
@@ -304,27 +303,58 @@ def solve_schedule_with_pulp(file_path, prev_month_file_path=None):
             for d in range(num_days - 5):
                 prob += pulp.lpSum([x[e][d + i][1] + x[e][d + i][2] + x[e][d + i][3] for i in range(6)]) <= 5
 
+        # ✨ [NEW] 每日排班配置 & 夜班支持基础池
+        support_needs_names = set(CONFIG.get('NEEDS_NIGHT_SUPPORT', []))
+        support_needs_indices = {e for e in range(num_emp) if employees[e] in support_needs_names}
+        noc_base_pool = [e for e in noc_seniors if e not in support_needs_indices]
+        csc_base_pool = [e for e in csc_seniors if e not in support_needs_indices]
+
         for d in range(num_days):
-            prob += pulp.lpSum([x[e][d][2] for e in noc_seniors]) == 1
-            prob += pulp.lpSum([x[e][d][2] for e in csc_seniors]) == 1
-            if d > 0: prob += pulp.lpSum([x[e][d][3] for e in all_seniors]) == 2
+            prob += pulp.lpSum([x[e][d][2] for e in noc_base_pool]) == 1
+            prob += pulp.lpSum([x[e][d][2] for e in csc_base_pool]) == 1
+            prob += pulp.lpSum([x[e][d][2] for e in noc_seniors]) <= 2
+
+        # ✨ [NEW] 夜班搭档(同伴)约束
+        support_pool = CONFIG.get('NIGHT_SUPPORT_POOL', {})
+        for target_idx in support_needs_indices:
+            target_name = employees[target_idx]
+            pool_names = support_pool.get(target_name, [])
+            valid_pool_indices = [employees.index(name) for name in pool_names if name in employees]
+            
+            if valid_pool_indices:
+                for d in range(num_days):
+                    s_support_miss = pulp.LpVariable(f'slack_support_miss_{target_idx}_{d}', cat=pulp.LpBinary)
+                    prob += x[target_idx][d][2] - pulp.lpSum([x[p_idx][d][2] for p_idx in valid_pool_indices]) <= s_support_miss
+                    penalties.append(CONFIG.get('PENALTY_NIGHT_PARTNER_MISSING', 50000) * s_support_miss)
+
+        # ✨ [NEW] 个人夜班 / 日班 次数限制
+        limit_noc = CONFIG.get('LIMIT_NOC_NIGHT_MAX', 4)
+        limit_csc = CONFIG.get('LIMIT_CSC_NIGHT_MAX', 6)
+        target_support = CONFIG.get('SUPPORT_NIGHT_TARGET', 3)
 
         for e in noc_seniors:
-            prob += pulp.lpSum([x[e][d][2] for d in range(num_days)]) >= 2
-            prob += pulp.lpSum([x[e][d][2] for d in range(num_days)]) <= 4
             prob += pulp.lpSum([x[e][d][1] for d in range(num_days)]) >= 4
+            if e in support_needs_indices:
+                prob += pulp.lpSum([x[e][d][2] for d in range(num_days)]) == target_support
+            else:
+                prob += pulp.lpSum([x[e][d][2] for d in range(num_days)]) >= 2
+                prob += pulp.lpSum([x[e][d][2] for d in range(num_days)]) <= limit_noc
 
         for e in csc_seniors:
-            prob += pulp.lpSum([x[e][d][2] for d in range(num_days)]) >= 2
-            prob += pulp.lpSum([x[e][d][2] for d in range(num_days)]) <= 5
+            if e in support_needs_indices:
+                prob += pulp.lpSum([x[e][d][2] for d in range(num_days)]) == target_support
+            else:
+                prob += pulp.lpSum([x[e][d][2] for d in range(num_days)]) >= 2
+                prob += pulp.lpSum([x[e][d][2] for d in range(num_days)]) <= limit_csc
 
         for e in trainee_indices:
             prob += pulp.lpSum([x[e][d][2] for d in range(num_days)]) >= 2
             prob += pulp.lpSum([x[e][d][2] for d in range(num_days)]) <= 5
 
+        # ✨ [NEW] 夜班平分均衡 (仅在base pool中计算)
         noc_n_max = pulp.LpVariable('noc_n_max', lowBound=0, cat=pulp.LpInteger)
         noc_n_min = pulp.LpVariable('noc_n_min', lowBound=0, cat=pulp.LpInteger)
-        for e in noc_seniors:
+        for e in noc_base_pool:
             total_n_e = pulp.lpSum([x[e][d][2] for d in range(num_days)])
             prob += total_n_e <= noc_n_max
             prob += total_n_e >= noc_n_min
@@ -332,7 +362,7 @@ def solve_schedule_with_pulp(file_path, prev_month_file_path=None):
 
         csc_n_max = pulp.LpVariable('csc_n_max', lowBound=0, cat=pulp.LpInteger)
         csc_n_min = pulp.LpVariable('csc_n_min', lowBound=0, cat=pulp.LpInteger)
-        for e in csc_seniors:
+        for e in csc_base_pool:
             total_n_e = pulp.lpSum([x[e][d][2] for d in range(num_days)])
             prob += total_n_e <= csc_n_max
             prob += total_n_e >= csc_n_min
@@ -406,14 +436,6 @@ def solve_schedule_with_pulp(file_path, prev_month_file_path=None):
                 s_d2_dense = pulp.LpVariable(f'slack_d2_dense_{m}_{d}', cat=pulp.LpBinary)
                 prob += y_d2[m][d] + y_d2[m][d + 1] + y_d2[m][d + 2] - s_d2_dense <= 1
                 penalties.append(CONFIG.get('PENALTY_D2_DENSE', 15000) * s_d2_dense)
-
-        for tr_name, mentor_name in night_partner_map.items():
-            if tr_name in employees and mentor_name in employees:
-                tr_idx, m_idx = employees.index(tr_name), employees.index(mentor_name)
-                for d in range(num_days):
-                    s_night_partner = pulp.LpVariable(f'slack_night_partner_{tr_idx}_{d}', cat=pulp.LpBinary)
-                    prob += x[tr_idx][d][2] - x[m_idx][d][2] <= s_night_partner
-                    penalties.append(CONFIG.get('PENALTY_NIGHT_PARTNER_MISSING', 50000) * s_night_partner)
 
         for e in range(num_emp):
             for d in range(num_days):
@@ -537,12 +559,13 @@ def solve_schedule_with_pulp(file_path, prev_month_file_path=None):
     print(f'📁 シフト表の出力が完了しました: {out_file}\n')
 
 
-# ================= 3. 役割後処理エンジン =================
+# ================= 3. 役割後処理エンジン (✨ [NEW] D残高保護・純D絶対均等化版) =================
 def post_process_schedule(input_file, output_file):
     input_file = os.path.join(get_base_path(), input_file)
     output_file = os.path.join(get_base_path(), output_file)
 
-    print("🚀【シフト表役割後処理エンジン (削峰填谷・純D絶対均等化版)】を起動中...\n")
+    print("🚀【シフト表役割後処理エンジン (D残高保護・純D絶対均等化版)】を起動中...\n")
+
     if not os.path.exists(input_file):
         print(f"❌ 入力ファイルが見つかりません: [{input_file}]")
         return
@@ -597,18 +620,24 @@ def post_process_schedule(input_file, output_file):
 
     holiday_dates = set(d for d in range(num_days) if is_holiday_check(d))
 
-    noc_seniors, csc_employees, seen_employees = [], [], set()
+    noc_seniors = []
+    csc_employees = []
+    seen_employees = set()
+
     for r in range(header_row + 2, ws.max_row + 1):
         team = ws.cell(row=r, column=team_col).value
         raw_name = ws.cell(row=r, column=name_col).value
         name = str(raw_name or "").strip().replace(" ", "").replace("\u3000", "").replace("\n", "")
+
         if not name or name in seen_employees: continue
         if team in ["NOC", "CSC"]:
             seen_employees.add(name)
-            if team == "NOC": noc_seniors.append((name, r))
-            elif team == "CSC": csc_employees.append((name, r))
+            if team == "NOC":
+                noc_seniors.append((name, r))
+            elif team == "CSC":
+                csc_employees.append((name, r))
 
-    # ================= 2. 初期役割割り当て (完全なカウントベース) =================
+    # ================= 2. NOC 初期役割割り当て (残高保護付き基础分配) =================
     noc_matrix = {}
     for name, r in noc_seniors:
         noc_matrix[name] = [str(ws.cell(row=r, column=day_start_col + d).value or "").strip() for d in range(num_days)]
@@ -616,32 +645,34 @@ def post_process_schedule(input_file, output_file):
     noc_counts = {name: {"メ": 0, "保全": 0, "メ/保全": 0} for name, _ in noc_seniors}
 
     for d in range(num_days):
+        current_ds = {name: sum(1 for di in range(num_days) if noc_matrix[name][di] == "D") for name, _ in noc_seniors}
         pure_d_candidates = [name for name, _ in noc_seniors if noc_matrix[name][d] == "D"]
         d_count = len(pure_d_candidates)
 
         if d_count == 2:
-            pure_d_candidates.sort(key=lambda x: noc_counts[x]["メ/保全"])
+            pure_d_candidates.sort(key=lambda x: (noc_counts[x]["メ/保全"], -current_ds[x]))
             noc_matrix[pure_d_candidates[0]][d] = "メ/保全"
             noc_counts[pure_d_candidates[0]]["メ/保全"] += 1
 
         elif d_count >= 3:
-            pure_d_candidates.sort(key=lambda x: noc_counts[x]["メ"])
+            pure_d_candidates.sort(key=lambda x: (noc_counts[x]["メ"], -current_ds[x]))
             me_name = pure_d_candidates.pop(0)
             noc_matrix[me_name][d] = "メ"
             noc_counts[me_name]["メ"] += 1
 
-            pure_d_candidates.sort(key=lambda x: noc_counts[x]["保全"])
+            pure_d_candidates.sort(key=lambda x: (noc_counts[x]["保全"], -current_ds[x]))
             ho_name = pure_d_candidates.pop(0)
             noc_matrix[ho_name][d] = "保全"
             noc_counts[ho_name]["保全"] += 1
 
-            # 1人をDに残し、残りをタスクにする
+            # ✨【NEW】D残高が一番「少ない」人をDに残して保護する
+            pure_d_candidates.sort(key=lambda x: current_ds[x])
             for name in pure_d_candidates[1:]:
                 noc_matrix[name][d] = "タスク"
 
-    # ================= 3. NOC 純D峰値互換平坦化エンジン (削峰填谷) =================
+    # ================= 3. NOC 純D峰値互換平坦化エンジン (削峰填谷: D ⇔ タスク) =================
     print("🔄 [NOC] 純Dの多すぎる人と少なすぎる人の「D ⇔ タスク」直接互換調整を開始します...")
-    swap_count = 0
+    noc_swap_count = 0
 
     while True:
         d_totals = {name: sum(1 for d in range(num_days) if noc_matrix[name][d] == "D") for name, _ in noc_seniors}
@@ -649,6 +680,7 @@ def post_process_schedule(input_file, output_file):
         
         max_emp = max(d_totals, key=d_totals.get)
         min_emp = min(d_totals, key=d_totals.get)
+        
         if d_totals[max_emp] - d_totals[min_emp] <= 1:
             break
 
@@ -659,44 +691,50 @@ def post_process_schedule(input_file, output_file):
                 if task_candidates:
                     task_candidates.sort(key=lambda x: d_totals[x])
                     target_task_emp = task_candidates[0]
+
                     if d_totals[max_emp] - d_totals[target_task_emp] >= 2:
                         noc_matrix[max_emp][d] = "タスク"
                         noc_matrix[target_task_emp][d] = "D"
                         swapped_in_this_loop = True
-                        swap_count += 1
-                        print(f"   ⚡ NOC: [{max_emp}](D={d_totals[max_emp]}) ⇔ [{target_task_emp}](D={d_totals[target_task_emp]}) 第 {d+1:2d} 日互換 (D ⇔ タスク)")
+                        noc_swap_count += 1
+                        print(f"    ⚡ NOC: [{max_emp}](D={d_totals[max_emp]}) ⇔ [{target_task_emp}](D={d_totals[target_task_emp]}) 第 {d+1:2d} 日 (D ⇔ タスク)")
                         break
 
         if not swapped_in_this_loop:
-            print("   ⚠️ NOC: これ以上互換可能な日が存在しないため、最適化調整を終了します。")
+            print("    ⚠️ NOC: これ以上互換可能な日が存在しないため調整を終了します。")
             break
 
-    print(f"✅ NOC 削峰填谷完了: 合計 {swap_count} 回の [D ⇔ タスク] 互換を実行しました。\n")
+    print(f"✅ NOC 削峰填谷完了: 合計 {noc_swap_count} 回実行。\n")
 
     for name, r in noc_seniors:
         for d in range(num_days):
             ws.cell(row=r, column=day_start_col + d).value = noc_matrix[name][d]
 
-    # ================= 4. CSC チーム後処理 =================
+    # ================= 4. CSC チーム後処理 (残高保護付き基礎発札 + 再平衡 D ⇔ 勤) =================
     csc_matrix = {name: [str(ws.cell(row=r, column=day_start_col + d).value or "").strip() for d in range(num_days)] for name, r in csc_employees}
     csc_counts = {name: {"メ": 0, "勤": 0} for name, _ in csc_employees}
 
     for d in range(num_days):
         if d in holiday_dates: continue
+
+        current_ds = {name: sum(1 for di in range(num_days) if csc_matrix[name][di] == "D") for name, _ in csc_employees}
         d_candidates = [name for name, _ in csc_employees if csc_matrix[name][d] == "D"]
         assigned_me = [name for name, _ in csc_employees if csc_matrix[name][d] == "メ"]
+
         if not assigned_me and len(d_candidates) >= 2:
-            d_candidates.sort(key=lambda x: csc_counts[x]["メ"])
+            d_candidates.sort(key=lambda x: (csc_counts[x]["メ"], -current_ds[x]))
             me_name = d_candidates.pop(0)
             csc_matrix[me_name][d] = "メ"
             csc_counts[me_name]["メ"] += 1
-        for name in d_candidates[:-1]:
-            csc_matrix[name][d] = "勤"
-            csc_counts[name]["勤"] += 1
 
-    # =========================================================================
-    # ✨ CSC 削峰填谷 (Peak-shaving / Valley-filling) の復元
-    # =========================================================================
+        if d_candidates:
+            # ✨【NEW】D残高が一番「少ない」人をDに残して保護する
+            d_candidates.sort(key=lambda x: current_ds[x])
+            for name in d_candidates[1:]:
+                csc_matrix[name][d] = "勤"
+                csc_counts[name]["勤"] += 1
+
+    # --- CSC 削峰填谷 (D ⇔ 勤) ---
     print("🔄 [CSC] 純Dの多すぎる人と少なすぎる人の「D ⇔ 勤」直接互換調整を開始します...")
     csc_swap_count = 0
 
@@ -738,29 +776,25 @@ def post_process_schedule(input_file, output_file):
         for d in range(num_days):
             ws.cell(row=r, column=day_start_col + d).value = csc_matrix[name][d]
 
-    # ================= レポートサマリー出力 =================
-    # NOC レポート
-    final_report = {name: {"純D": 0, "メ": 0, "保全": 0, "メ/保全": 0, "タスク": 0} for name, _ in noc_seniors}
+    # ================= 5. レポートサマリー出力 =================
+    noc_report = {name: {"純D": 0, "メ": 0, "保全": 0, "メ/保全": 0, "タスク": 0} for name, _ in noc_seniors}
     for name, _ in noc_seniors:
         for d in range(num_days):
             val = noc_matrix[name][d]
-            if val == "D": final_report[name]["純D"] += 1
-            elif val == "メ": final_report[name]["メ"] += 1
-            elif val == "保全": final_report[name]["保全"] += 1
-            elif val == "メ/保全": final_report[name]["メ/保全"] += 1
-            elif val == "タスク": final_report[name]["タスク"] += 1
+            if val == "D": noc_report[name]["純D"] += 1
+            elif val == "メ": noc_report[name]["メ"] += 1
+            elif val == "保全": noc_report[name]["保全"] += 1
+            elif val == "メ/保全": noc_report[name]["メ/保全"] += 1
+            elif val == "タスク": noc_report[name]["タスク"] += 1
 
     print("📈【NOC 役割分配の最終公平性レポート】:")
     print("-" * 60)
     print(f"{'名前':<10s} | {'純D':<4s} | {'メ':<4s} | {'保全':<4s} | {'メ/保全':<6s} | {'タスク':<6s}")
     print("-" * 60)
-    for name, counts in final_report.items():
+    for name, counts in noc_report.items():
         print(f"{name:10s} | {counts['純D']:4d} | {counts['メ']:4d} | {counts['保全']:4d} | {counts['メ/保全']:7d} | {counts['タスク']:4d}")
     print("-" * 60 + "\n")
 
-    # =========================================================================
-    # ✨ CSC 公平性レポート の復元
-    # =========================================================================
     csc_report = {name: {"純D": 0, "メ": 0, "勤": 0} for name, _ in csc_employees}
     for name, _ in csc_employees:
         for d in range(num_days):
@@ -777,7 +811,7 @@ def post_process_schedule(input_file, output_file):
         print(f"{name:10s} | {counts['純D']:4d} | {counts['メ']:4d} | {counts['勤']:4d}")
     print("-" * 50 + "\n")
 
-    # 最終スタイル適用
+    # 最终样式应用
     red_font = Font(color='FF0000')
     black_font = Font(color='000000')
     purple_fill = PatternFill(start_color='E6E6FA', end_color='E6E6FA', fill_type='solid')
@@ -809,7 +843,7 @@ def main():
         print("=" * 50)
         print("  [1] クラウドから最新データを取得")
         print("  [2] PuLP最適化計算を実行 (シフト生成)")
-        print("  [3] 役割とルールの後処理 (最終調整)")
+        print("  [3] 役割とルールの後処理 (最终調整・D保護)")
         print("-" * 50)
         print("  [4] 全自動一括実行 (1~3を連続実行)")
         print("  [0] システムを終了")
